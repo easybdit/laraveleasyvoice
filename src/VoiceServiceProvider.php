@@ -29,13 +29,20 @@ class VoiceServiceProvider extends ServiceProvider
     {
         $this->loadMigrationsFrom(__DIR__.'/../database/migrations');
 
-        if (config('voice.routes.enabled', false)) {
-            $middleware = array_merge(
-                config('voice.routes.middleware', ['web', 'auth']),
-                ['throttle:'.config('voice.routes.throttle', '30,1')],
-            );
+        $middleware = array_merge(
+            config('voice.routes.middleware', ['web', 'auth']),
+            ['throttle:'.config('voice.routes.throttle', '30,1')],
+        );
 
+        if (config('voice.routes.enabled', false)) {
             Route::middleware($middleware)->group(__DIR__.'/../routes/voice.php');
+        }
+
+        // Independent toggle from voice.routes.enabled - a host app may
+        // want the realtime token endpoint without the full turn-based
+        // session/turn API, or vice versa.
+        if (config('voice.realtime.enabled', false)) {
+            Route::middleware($middleware)->group(__DIR__.'/../routes/voice-realtime.php');
         }
 
         if ($this->app->runningInConsole()) {
@@ -46,6 +53,10 @@ class VoiceServiceProvider extends ServiceProvider
             $this->publishes([
                 __DIR__.'/../database/migrations' => database_path('migrations'),
             ], 'voice-migrations');
+
+            $this->publishes([
+                __DIR__.'/../resources/js/voice-widget.js' => public_path('vendor/laraveleasyvoice/voice-widget.js'),
+            ], 'voice-assets');
 
             $this->commands([InstallCommand::class]);
         }

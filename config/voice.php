@@ -151,4 +151,31 @@ return [
         'max_upload_kb' => env('VOICE_ROUTES_MAX_UPLOAD_KB', 25600),
     ],
 
+    /*
+    |--------------------------------------------------------------------
+    | Realtime (ephemeral token minting only)
+    |--------------------------------------------------------------------
+    |
+    | This package does not implement a realtime voice connection itself
+    | - see Contracts\RealtimeVoiceProvider's docblock for why. What it
+    | can do safely is the one server-side step a browser-direct realtime
+    | integration actually needs: minting a short-lived client token so
+    | your real API key never reaches the browser. The browser then
+    | connects directly to the provider (e.g. via WebRTC, following that
+    | provider's own official client library/quickstart) - this package
+    | is not involved in that connection at all.
+    |
+    */
+    'realtime' => [
+        'enabled' => env('VOICE_REALTIME_ENABLED', false),
+
+        'openai' => [
+            'api_key' => env('VOICE_OPENAI_API_KEY', env('OPENAI_API_KEY')),
+            'url' => env('VOICE_OPENAI_BASE_URL', 'https://api.openai.com/v1'),
+            'model' => env('VOICE_REALTIME_OPENAI_MODEL', 'gpt-4o-realtime-preview'),
+            'voice' => env('VOICE_REALTIME_OPENAI_VOICE', 'alloy'),
+            'timeout' => env('VOICE_REALTIME_OPENAI_TIMEOUT', 15),
+        ],
+    ],
+
 ];

@@ -97,6 +97,8 @@ Add a path repository to your own (uncommitted) local composer config rather tha
 - **`Analytics\VoiceUsage`** — a query service over `voice_sessions`/`voice_turns` for aggregate or per-session usage (STT/TTS duration, tokens, estimated cost, latency), for building your own admin view or a future billing layer.
 - **Human handoff** — `VoiceAgent::requestHandoff()`/`completeHandoff()` fire `HandoffRequested`/`HandoffCompleted` events for notifying a human agent through whatever channel you already use.
 - **Cross-session memory (opt-in tools)** — `RememberFactTool`/`RecallFactTool` give an agent a small per-caller key-value fact store that survives across separate sessions, gated by the same `Gate`-based authorization as any other tool.
+- **Browser widget** (`voice-widget.js`, opt-in, zero dependencies) — a small vanilla-JS client for the HTTP API: start a session, record with `MediaRecorder`, upload the turn, play the reply. See "Browser voice agent" in the Cookbook below.
+- **Realtime ephemeral token endpoint (opt-in)** — `POST /voice/realtime/token` mints a short-lived OpenAI Realtime API client token server-side, so your real key never reaches the browser. This is intentionally the full extent of this package's realtime support today — see "Realtime" below for why.
 - **`RealtimeVoiceProvider`/`RealtimeConnection`** — design-stage contracts only, not implemented by anything yet. See "Not implemented yet" below.
 
 With this, every item in the original v0.1 scope is implemented — see [CHANGELOG.md](CHANGELOG.md) for the full build history.
@@ -276,9 +278,63 @@ Once the human has actually taken over, call `$agent->completeHandoff($session, 
 
 Every session created through the HTTP API now carries `tenant_id`, and `VoiceSession::isOwnedBy()` enforces it on every subsequent request to that session - a 403 for a mismatched tenant, not just a mismatched user.
 
+**Browser voice agent**
+
+```env
+VOICE_ROUTES_ENABLED=true
+```
+
+```html
+<script src="/vendor/laraveleasyvoice/voice-widget.js"></script>
+<meta name="csrf-token" content="{{ csrf_token() }}">
+
+<button id="talk">Hold to talk</button>
+<script>
+  const widget = new VoiceWidget({
+      agent: 'receptionist',
+      onStateChange: (state) => console.log('state:', state), // idle, starting, ready, recording, uploading, speaking, ended
+      onResponse: (turn) => console.log('assistant said:', turn.transcript),
+      onError: (error) => console.error(error),
+  });
+
+  const button = document.getElementById('talk');
+
+  (async () => {
+      await widget.start();
+
+      button.addEventListener('mousedown', () => widget.startRecording());
+      button.addEventListener('mouseup', () => widget.stopRecording());
+  })();
+</script>
+```
+
+Publish the widget file first: `php artisan vendor:publish --tag=voice-assets`. The widget only talks to this package's own HTTP API (already covered by the test suite above) — it ships no third-party code. `widget.stopSpeaking()` stops local playback immediately (a "stop talking" control), but note it is **not** server-side barge-in — see the note in the widget's own file, and "Realtime" below.
+
+**Realtime (ephemeral token only)**
+
+```env
+VOICE_REALTIME_ENABLED=true
+VOICE_REALTIME_OPENAI_VOICE=alloy
+```
+
+```js
+const response = await fetch('/voice/realtime/token', {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: {'X-CSRF-TOKEN': csrfToken, 'Content-Type': 'application/json'},
+    body: JSON.stringify({voice: 'alloy'}),
+});
+const {token} = await response.json(); // an "ek_..." token, expires quickly
+
+// Hand this token to OpenAI's own official realtime client library/quickstart
+// to open the actual WebRTC connection - this package's job ends here.
+```
+
+This is the one server-side step a browser-direct realtime integration genuinely needs (never expose your real API key to the browser) — not a realtime connection itself. Building the actual duplex audio connection is left to OpenAI's own official client tooling rather than reimplemented here; see "Not implemented yet" for why.
+
 ## Not implemented yet
 
-No realtime/WebSocket transport, no barge-in/interruption, no browser widget/JS, no telephony. `RealtimeVoiceProvider`/`RealtimeConnection` exist as design-stage contracts only — no class implements either, and both docblocks say so — because *how* Laravel should host a long-lived duplex connection at all (Octane+Reverb relaying in-process, an external relay service, or exposing the provider's own realtime endpoint to the browser with this package only minting a short-lived token) is an infrastructure decision, not something a contract should presume. These are sequenced deliberately, not overlooked — each is a larger, harder-to-reverse decision than anything shipped so far, and gets designed and reviewed on its own. See [CHANGELOG.md](CHANGELOG.md) for the reasoning.
+**A full realtime voice connection.** `Contracts\RealtimeVoiceProvider`/`RealtimeConnection` exist as design-stage contracts only — no class implements either, and both docblocks say so. *How* Laravel should host a long-lived duplex connection at all (Octane+Reverb relaying in-process, an external relay service, or the browser-direct approach the token endpoint above enables) is an infrastructure decision this package won't presume on your behalf. **Barge-in/interruption** needs that same realtime connection to mean anything server-side (there's nothing to cancel mid-generation without one) — the widget's `stopSpeaking()` is a client-side approximation only. **Telephony/SIP** is deliberately untouched — it also carries call-recording-consent obligations that belong to your application, not this package. These are sequenced, not overlooked — each is a larger, harder-to-reverse decision than anything shipped so far. See [CHANGELOG.md](CHANGELOG.md) for the full reasoning.
 
 ## Security & Trust
 
