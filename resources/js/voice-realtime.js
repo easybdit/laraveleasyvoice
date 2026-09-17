@@ -40,9 +40,14 @@ class VoiceRealtimeSession {
     /**
      * @param {Object} options
      * @param {string} [options.baseUrl='/voice'] - matches config('voice.routes.prefix').
+     * @param {string} [options.provider='openai'] - the ONLY value this class actually knows how to
+     *     speak to right now (WebRTC + OpenAI's "oai-events" data channel schema). Passed through to
+     *     the token endpoint either way, so a future server-registered provider's token request still
+     *     works - but connect() below still only performs OpenAI's specific WebRTC handshake, and
+     *     throws rather than silently misconnecting if you pass anything else.
      * @param {string} [options.csrfToken] - defaults to <meta name="csrf-token"> if present.
-     * @param {string} [options.model] - overrides config('voice.realtime.openai.model') for this call.
-     * @param {string} [options.voice] - overrides config('voice.realtime.openai.voice') for this call.
+     * @param {string} [options.model] - overrides config('voice.realtime.providers.openai.model') for this call.
+     * @param {string} [options.voice] - overrides config('voice.realtime.providers.openai.voice') for this call.
      * @param {(event: Object) => void} [options.onEvent] - every JSON event received on the data channel, raw.
      * @param {() => void} [options.onConnected]
      * @param {(error: Error) => void} [options.onError]
@@ -51,6 +56,7 @@ class VoiceRealtimeSession {
      */
     constructor(options = {}) {
         this.baseUrl = options.baseUrl || '/voice';
+        this.provider = options.provider || 'openai';
         this.model = options.model || null;
         this.voice = options.voice || null;
         this.csrfToken = options.csrfToken || (typeof VoiceWidget !== 'undefined'
@@ -93,7 +99,7 @@ class VoiceRealtimeSession {
             method: 'POST',
             credentials: 'same-origin',
             headers,
-            body: JSON.stringify({model: this.model, voice: this.voice}),
+            body: JSON.stringify({provider: this.provider, model: this.model, voice: this.voice}),
         });
 
         if (!response.ok) {
@@ -111,6 +117,16 @@ class VoiceRealtimeSession {
      * call close() before connecting again.
      */
     async connect() {
+        if (this.provider !== 'openai') {
+            const error = new Error(
+                `VoiceRealtimeSession only knows how to connect to 'openai' (WebRTC + the oai-events `
+                + `data channel schema) - '${this.provider}' was requested, which needs its own client `
+                + `implementation, not just a different token.`
+            );
+            this.onError(error);
+            throw error;
+        }
+
         try {
             const {token} = await this.fetchToken();
 

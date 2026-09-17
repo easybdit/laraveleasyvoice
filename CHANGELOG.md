@@ -4,6 +4,18 @@
 
 Per-phase entries, same convention as v0.1's build-up — logged as work lands on `main`, tagged as a release only once enough has accumulated to justify a version bump (not after every phase). See "v0.1.0" further down for what's already tagged and published.
 
+### 🔀 Phase 11: realtime becomes provider-selectable (openai today, more later)
+
+Prompted directly by the user asking why Together AI (already proven live for STT/TTS in Phase 9) couldn't also power realtime, given Together hosts Cartesia Sonic. Worth answering precisely rather than just saying no: researched Cartesia's realtime API before responding, and it's **one-way streaming TTS over WebSocket** (text in, audio out) — no speech-in, no LLM orchestration, no turn-taking. OpenAI's Realtime API is a fundamentally different thing: one integrated WebRTC session doing STT+LLM+TTS+voice-activity-detection+turn-taking, all server-side - which is exactly why Phase 10's entire footprint could be "mint a token, do one WebRTC handshake." A Together/Cartesia equivalent would mean building that whole orchestration loop (streaming STT, an LLM call, streaming TTS, and this package's own turn-taking/interruption logic) - a real, separate project, not a config entry, and explicitly *not* rushed into this phase on unconfirmed protocol details (Cartesia's exact WebSocket URL/auth format were not fully confirmed even during this research).
+
+What *was* the right-sized response: make the architecture provider-selectable now, the same pattern already used for `voice.stt`/`voice.tts`, so adding a second realtime provider later is additive, not a breaking change, and so the developer using this package - not this package - decides which provider to use, once more than one exists.
+
+- `voice.realtime.openai` → `voice.realtime.providers.openai` (+ new `voice.realtime.default`, defaults to `'openai'`), mirroring `voice.stt`/`voice.tts`'s exact shape.
+- `POST /voice/realtime/token` accepts an optional `provider` parameter; requesting anything other than `'openai'` returns a clear `422` *without attempting a request* (verified via `Http::assertNothingSent()`) - a client error, not a provider failure, since nothing was even tried.
+- `VoiceRealtimeSession` accepts a `provider` option (defaults `'openai'`, forwarded to the token endpoint for forward-compatibility) and `connect()` throws immediately for anything else, rather than attempting OpenAI-specific WebRTC/SDP logic against a provider that doesn't speak that protocol.
+
+3 new/updated tests. 61 tests, 158 assertions, all passing.
+
 ### 📡 Phase 10: a real browser-direct realtime voice client
 
 Closes the biggest remaining gap without needing the infrastructure decision this project kept flagging (Octane+Reverb vs. an external relay) — because the browser-direct option was already half-built in Phase 8's token endpoint. The only missing piece was purely client-side: the actual WebRTC signaling.

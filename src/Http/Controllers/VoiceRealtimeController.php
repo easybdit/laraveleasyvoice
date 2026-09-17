@@ -25,11 +25,25 @@ class VoiceRealtimeController extends Controller
         }
 
         $validated = $request->validate([
+            'provider' => ['nullable', 'string', 'max:40'],
             'model' => ['nullable', 'string', 'max:100'],
             'voice' => ['nullable', 'string', 'max:50'],
         ]);
 
-        $broker = new OpenAiRealtimeTokenBroker(config('voice.realtime.openai', []));
+        $provider = $validated['provider'] ?? config('voice.realtime.default', 'openai');
+
+        // Only 'openai' exists today - see config/voice.php's own
+        // "realtime" docblock for exactly what a second provider would
+        // need before it could be added here. Requesting an unsupported
+        // one is a client error (422), not a 502 - nothing was even
+        // attempted, so it's not a provider failure.
+        if ($provider !== 'openai') {
+            return response()->json([
+                'error' => "Unsupported realtime provider: {$provider}. Only 'openai' is implemented today.",
+            ], 422);
+        }
+
+        $broker = new OpenAiRealtimeTokenBroker(config('voice.realtime.providers.openai', []));
 
         try {
             $result = $broker->createEphemeralToken($validated);
@@ -39,6 +53,6 @@ class VoiceRealtimeController extends Controller
             return response()->json(['error' => 'The realtime provider is temporarily unavailable.'], 502);
         }
 
-        return response()->json($result);
+        return response()->json(array_merge($result, ['provider' => $provider]));
     }
 }

@@ -14,7 +14,7 @@ class VoiceRealtimeTokenTest extends TestCase
 
         $app['config']->set('voice.realtime.enabled', true);
         $app['config']->set('voice.routes.middleware', ['web', 'auth']);
-        $app['config']->set('voice.realtime.openai', [
+        $app['config']->set('voice.realtime.providers.openai', [
             'api_key' => 'test-key',
             'url' => 'https://api.openai.com/v1',
             'model' => 'gpt-4o-realtime-preview',
@@ -54,7 +54,8 @@ class VoiceRealtimeTokenTest extends TestCase
             ->assertJsonPath('token', 'ek_test_12345')
             ->assertJsonPath('expires_at', 1234567890)
             ->assertJsonPath('model', 'gpt-4o-realtime-preview')
-            ->assertJsonPath('voice', 'alloy');
+            ->assertJsonPath('voice', 'alloy')
+            ->assertJsonPath('provider', 'openai');
 
         Http::assertSent(function ($request) {
             return str_contains($request->url(), 'realtime/client_secrets')
@@ -93,5 +94,32 @@ class VoiceRealtimeTokenTest extends TestCase
 
         $response->assertStatus(502);
         $this->assertStringNotContainsString('sk-secret-leak', $response->getContent());
+    }
+
+    public function test_it_rejects_an_unsupported_provider_without_attempting_a_request(): void
+    {
+        $this->actingAsFakeUser();
+
+        Http::fake();
+
+        $this->postJson('/voice/realtime/token', ['provider' => 'together'])
+            ->assertStatus(422)
+            ->assertJsonFragment(['error' => "Unsupported realtime provider: together. Only 'openai' is implemented today."]);
+
+        Http::assertNothingSent();
+    }
+
+    public function test_it_defaults_to_the_configured_provider(): void
+    {
+        $this->actingAsFakeUser();
+        config(['voice.realtime.default' => 'openai']);
+
+        Http::fake([
+            'api.openai.com/v1/realtime/client_secrets' => Http::response(['value' => 'ek_default', 'expires_at' => null]),
+        ]);
+
+        $this->postJson('/voice/realtime/token')
+            ->assertOk()
+            ->assertJsonPath('provider', 'openai');
     }
 }

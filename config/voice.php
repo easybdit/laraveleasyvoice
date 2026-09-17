@@ -165,25 +165,40 @@ return [
     | provider's own official client library/quickstart) - this package
     | is not involved in that connection at all.
     |
+    | Provider-namespaced the same way voice.stt/voice.tts are, so a
+    | second realtime provider can be added later without a breaking
+    | change - but note realtime protocols are NOT interchangeable the
+    | way simple request/response STT/TTS endpoints often are: OpenAI's
+    | is one integrated WebRTC session doing STT+LLM+TTS+turn-taking
+    | server-side, while e.g. Cartesia's realtime API is TTS-only
+    | (streaming audio out, no speech-in, no turn-taking) over a
+    | different transport (WebSocket, not WebRTC). Only 'openai' is
+    | implemented today; see resources/js/voice-realtime.js's docblock
+    | and README.md's Realtime section for exactly what a second
+    | provider would require before it could be added.
+    |
     */
     'realtime' => [
         'enabled' => env('VOICE_REALTIME_ENABLED', false),
+        'default' => env('VOICE_REALTIME_PROVIDER', 'openai'),
 
-        'openai' => [
-            // Deliberately its OWN key/URL, not shared with voice.stt/tts's
-            // "openai" provider - those are meant to be pointed at any
-            // OpenAI-*compatible* endpoint (Together, a proxy, ...) and
-            // doing that here too would silently send this real OpenAI
-            // account's traffic to a different host. Realtime's WebRTC
-            // signaling is not known to be implemented by any
-            // OpenAI-compatible provider, so this always targets OpenAI's
-            // real API and needs a real OpenAI key even if your STT/TTS
-            // key above belongs to a different provider entirely.
-            'api_key' => env('VOICE_REALTIME_OPENAI_API_KEY', env('OPENAI_API_KEY')),
-            'url' => env('VOICE_REALTIME_OPENAI_BASE_URL', 'https://api.openai.com/v1'),
-            'model' => env('VOICE_REALTIME_OPENAI_MODEL', 'gpt-4o-realtime-preview'),
-            'voice' => env('VOICE_REALTIME_OPENAI_VOICE', 'alloy'),
-            'timeout' => env('VOICE_REALTIME_OPENAI_TIMEOUT', 15),
+        'providers' => [
+            'openai' => [
+                // Deliberately its OWN key/URL, not shared with voice.stt/tts's
+                // "openai" provider - those are meant to be pointed at any
+                // OpenAI-*compatible* endpoint (Together, a proxy, ...) and
+                // doing that here too would silently send this real OpenAI
+                // account's traffic to a different host. Realtime's WebRTC
+                // signaling is not known to be implemented by any
+                // OpenAI-compatible provider, so this always targets OpenAI's
+                // real API and needs a real OpenAI key even if your STT/TTS
+                // key above belongs to a different provider entirely.
+                'api_key' => env('VOICE_REALTIME_OPENAI_API_KEY', env('OPENAI_API_KEY')),
+                'url' => env('VOICE_REALTIME_OPENAI_BASE_URL', 'https://api.openai.com/v1'),
+                'model' => env('VOICE_REALTIME_OPENAI_MODEL', 'gpt-4o-realtime-preview'),
+                'voice' => env('VOICE_REALTIME_OPENAI_VOICE', 'alloy'),
+                'timeout' => env('VOICE_REALTIME_OPENAI_TIMEOUT', 15),
+            ],
         ],
     ],
 
