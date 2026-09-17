@@ -195,7 +195,7 @@ return [
                 // key above belongs to a different provider entirely.
                 'api_key' => env('VOICE_REALTIME_OPENAI_API_KEY', env('OPENAI_API_KEY')),
                 'url' => env('VOICE_REALTIME_OPENAI_BASE_URL', 'https://api.openai.com/v1'),
-                'model' => env('VOICE_REALTIME_OPENAI_MODEL', 'gpt-4o-realtime-preview'),
+                'model' => env('VOICE_REALTIME_OPENAI_MODEL', 'gpt-realtime'),
                 'voice' => env('VOICE_REALTIME_OPENAI_VOICE', 'alloy'),
                 'timeout' => env('VOICE_REALTIME_OPENAI_TIMEOUT', 15),
             ],

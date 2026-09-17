@@ -17,7 +17,7 @@ class VoiceRealtimeTokenTest extends TestCase
         $app['config']->set('voice.realtime.providers.openai', [
             'api_key' => 'test-key',
             'url' => 'https://api.openai.com/v1',
-            'model' => 'gpt-4o-realtime-preview',
+            'model' => 'gpt-realtime',
             'voice' => 'alloy',
             'timeout' => 10,
         ]);
@@ -44,7 +44,7 @@ class VoiceRealtimeTokenTest extends TestCase
             'api.openai.com/v1/realtime/client_secrets' => Http::response([
                 'value' => 'ek_test_12345',
                 'expires_at' => 1234567890,
-                'session' => ['model' => 'gpt-4o-realtime-preview'],
+                'session' => ['model' => 'gpt-realtime'],
             ]),
         ]);
 
@@ -53,14 +53,19 @@ class VoiceRealtimeTokenTest extends TestCase
         $response->assertOk()
             ->assertJsonPath('token', 'ek_test_12345')
             ->assertJsonPath('expires_at', 1234567890)
-            ->assertJsonPath('model', 'gpt-4o-realtime-preview')
+            ->assertJsonPath('model', 'gpt-realtime')
             ->assertJsonPath('voice', 'alloy')
             ->assertJsonPath('provider', 'openai');
 
+        // This exact shape (session.type, and voice nested under
+        // session.audio.output.voice rather than a flat session.voice)
+        // was corrected against OpenAI's real, live API, not assumed -
+        // see OpenAiRealtimeTokenBroker's own docblock.
         Http::assertSent(function ($request) {
             return str_contains($request->url(), 'realtime/client_secrets')
-                && $request['session']['model'] === 'gpt-4o-realtime-preview'
-                && $request['session']['voice'] === 'alloy';
+                && $request['session']['type'] === 'realtime'
+                && $request['session']['model'] === 'gpt-realtime'
+                && $request['session']['audio']['output']['voice'] === 'alloy';
         });
     }
 
@@ -79,7 +84,7 @@ class VoiceRealtimeTokenTest extends TestCase
             ->assertOk()
             ->assertJsonPath('voice', 'verse');
 
-        Http::assertSent(fn ($request) => $request['session']['voice'] === 'verse');
+        Http::assertSent(fn ($request) => $request['session']['audio']['output']['voice'] === 'verse');
     }
 
     public function test_a_provider_failure_returns_a_generic_502_without_leaking_the_real_error(): void

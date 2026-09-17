@@ -4,6 +4,17 @@
 
 Per-phase entries, same convention as v0.1's build-up — logged as work lands on `main`, tagged as a release only once enough has accumulated to justify a version bump (not after every phase). See "v0.1.0" further down for what's already tagged and published.
 
+### 🛠️ Phase 12: the realtime token endpoint, corrected against a real live OpenAI account
+
+Phase 10 shipped `OpenAiRealtimeTokenBroker` "verified against OpenAI's current API documentation." That claim held for the endpoint URL and the response shape, but not for the full request body - confirmed by actually minting a token against a real OpenAI account and API key for the first time, which two separate documentation-review passes had not caught:
+
+1. `session.type: "realtime"` is a required field the request body was missing entirely - first live call failed with a clear `400 missing_required_parameter` naming exactly that field.
+2. `session.voice` doesn't exist in OpenAI's current (GA) schema - voice moved to the nested `session.audio.output.voice`. Second live call failed with `400 unknown_parameter: session.voice`, again naming the exact problem.
+
+Both fixed and **re-verified with a third live call, which succeeded** - a real `ek_`-prefixed token, a real `expires_at` timestamp, from a real OpenAI account. The default model was also updated from the preview-era `gpt-4o-realtime-preview` to the current GA `gpt-realtime`, per OpenAI's own current reference example.
+
+This is logged as its own phase deliberately, not folded silently into Phase 10's entry, because the gap it closes is exactly the caveat that entry itself stated up front: "'verified against docs' is not the same claim as 'tested against a live connection.'" That distinction turned out to matter in practice, not just as a disclaimer - live testing caught two real, would-have-shipped-broken issues that two rounds of documentation research had missed. Tests updated to match the corrected request shape (`session.type`, `session.audio.output.voice`). 6 tests in `VoiceRealtimeTokenTest`, 61 tests / 158 assertions overall, all passing.
+
 ### 🔀 Phase 11: realtime becomes provider-selectable (openai today, more later)
 
 Prompted directly by the user asking why Together AI (already proven live for STT/TTS in Phase 9) couldn't also power realtime, given Together hosts Cartesia Sonic. Worth answering precisely rather than just saying no: researched Cartesia's realtime API before responding, and it's **one-way streaming TTS over WebSocket** (text in, audio out) — no speech-in, no LLM orchestration, no turn-taking. OpenAI's Realtime API is a fundamentally different thing: one integrated WebRTC session doing STT+LLM+TTS+voice-activity-detection+turn-taking, all server-side - which is exactly why Phase 10's entire footprint could be "mint a token, do one WebRTC handshake." A Together/Cartesia equivalent would mean building that whole orchestration loop (streaming STT, an LLM call, streaming TTS, and this package's own turn-taking/interruption logic) - a real, separate project, not a config entry, and explicitly *not* rushed into this phase on unconfirmed protocol details (Cartesia's exact WebSocket URL/auth format were not fully confirmed even during this research).
