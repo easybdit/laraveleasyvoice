@@ -83,7 +83,7 @@ Add a path repository to your own (uncommitted) local composer config rather tha
 
 ## What's implemented today
 
-- **`Voice::stt($driver)` / `Voice::tts($driver)`** — provider-agnostic speech contracts (`SpeechToTextProvider`, `TextToSpeechProvider`), with an OpenAI implementation of each.
+- **`Voice::stt($driver)` / `Voice::tts($driver)`** — provider-agnostic speech contracts (`SpeechToTextProvider`, `TextToSpeechProvider`), with OpenAI, Deepgram (STT), and ElevenLabs (TTS) implementations.
 - **`Voice::registerAgent()` / `Voice::agent()`** — named, reusable voice agents that wire STT → LaravelEasyAI's `AI::provider()->tools()->run()` agent loop → TTS into one call.
 - **Sessions & turns** (`voice_sessions`, `voice_turns`) — persisted history per caller, with token/latency accounting on the session.
 - **Events** — `SessionStarted`, `SessionEnded`, `SpeechTranscribed`, `ToolCallStarted`, `ToolCallCompleted`, `ResponseSynthesized`, `VoiceError`, all fired through Laravel's own `Event` facade.
@@ -95,6 +95,9 @@ Add a path repository to your own (uncommitted) local composer config rather tha
 - **Tool tiers** — `AuthorizedTool::make(..., tier: 'destructive')` (`read`/`write`/`destructive`/`privileged`) surfaces on `ToolCallStarted`/`ToolCallCompleted` for auditing, alongside the `Gate` check that actually authorizes the call.
 - **Chat-history mirroring (opt-in)** — link a session to an existing `ai_chat_sessions` row (`chat_session_id`) and every turn is also written to `ai_chat_messages`, so a voice call and a text chat can share one transcript.
 - **`Analytics\VoiceUsage`** — a query service over `voice_sessions`/`voice_turns` for aggregate or per-session usage (STT/TTS duration, tokens, estimated cost, latency), for building your own admin view or a future billing layer.
+- **Human handoff** — `VoiceAgent::requestHandoff()`/`completeHandoff()` fire `HandoffRequested`/`HandoffCompleted` events for notifying a human agent through whatever channel you already use.
+- **Cross-session memory (opt-in tools)** — `RememberFactTool`/`RecallFactTool` give an agent a small per-caller key-value fact store that survives across separate sessions, gated by the same `Gate`-based authorization as any other tool.
+- **`RealtimeVoiceProvider`/`RealtimeConnection`** — design-stage contracts only, not implemented by anything yet. See "Not implemented yet" below.
 
 With this, every item in the original v0.1 scope is implemented — see [CHANGELOG.md](CHANGELOG.md) for the full build history.
 
@@ -232,7 +235,37 @@ Voice::registerAgent('multilingual', function ($agent) {
 
 Automatic language *detection* (rather than the caller specifying it) isn't built - Whisper can auto-detect if `language` is omitted, but nothing here inspects the transcript to switch the reply language or TTS voice automatically yet.
 
-**Memory** — within one session, prior turns are already included as context (`contextTurns()`, default 10) — "My name is Murad" followed by "What's my name?" works today as long as both are in the same call. Persisting that across separate sessions (a caller phoning back next week) isn't built - link `chat_session_id` to reuse LaravelEasyAI's own bounded chat history across channels, but note that's the *same kind* of context window, not a true long-term fact store; neither package has one of those yet.
+**Memory** — within one session, prior turns are already included as context (`contextTurns()`, default 10) — "My name is Murad" followed by "What's my name?" works today as long as both are in the same call. For the same fact to survive a *separate* call (the caller phoning back next week), opt an agent into the two memory tools:
+
+```php
+Voice::registerAgent('receptionist', function ($agent) {
+    $agent->stt('openai')->tts('openai')->llm('openai')
+        ->systemPrompt('If the caller shares their name or a preference, call remember_fact. If they ask you to recall something, call recall_fact first.')
+        ->tools([
+            RememberFactTool::make(),
+            RecallFactTool::make(),
+        ]);
+});
+```
+
+This is a small, flat per-caller key-value store (`voice_memories`), not a general memory/retrieval system — no embeddings, no staleness handling, nothing is captured automatically. A session with no identity at all (no tenant, no user, no guest token) can't use it, since there'd be nothing to scope the fact to.
+
+**Human handoff**
+
+```php
+// Inside a tool's handler, once the agent recognizes it can't help:
+$agent->requestHandoff($session, 'Caller wants a refund - outside this agent\'s scope.');
+```
+
+```php
+Event::listen(HandoffRequested::class, function ($event) {
+    // Notify a human however your app already does - Slack, a support queue, email.
+    Notification::route('slack', config('services.slack.support_channel'))
+        ->notify(new VoiceHandoffRequested($event->session, $event->reason));
+});
+```
+
+Once the human has actually taken over, call `$agent->completeHandoff($session, $reason)` to end the session with the reason recorded in its `metadata`.
 
 **Tenant-scoped multi-agent SaaS**
 
@@ -245,7 +278,7 @@ Every session created through the HTTP API now carries `tenant_id`, and `VoiceSe
 
 ## Not implemented yet
 
-No realtime/WebSocket transport, no barge-in/interruption, no human handoff, no browser widget/JS, no telephony, no non-OpenAI STT/TTS providers, no persistent cross-session memory (a real fact store, not a context window). These are sequenced deliberately, not overlooked — each is a larger, harder-to-reverse decision (long-lived connections, provider lock-in, public phone numbers, a specific widget API tied to whichever realtime transport comes first) than anything shipped so far, and gets designed and reviewed on its own. See [CHANGELOG.md](CHANGELOG.md) for the reasoning.
+No realtime/WebSocket transport, no barge-in/interruption, no browser widget/JS, no telephony. `RealtimeVoiceProvider`/`RealtimeConnection` exist as design-stage contracts only — no class implements either, and both docblocks say so — because *how* Laravel should host a long-lived duplex connection at all (Octane+Reverb relaying in-process, an external relay service, or exposing the provider's own realtime endpoint to the browser with this package only minting a short-lived token) is an infrastructure decision, not something a contract should presume. These are sequenced deliberately, not overlooked — each is a larger, harder-to-reverse decision than anything shipped so far, and gets designed and reviewed on its own. See [CHANGELOG.md](CHANGELOG.md) for the reasoning.
 
 ## Security & Trust
 

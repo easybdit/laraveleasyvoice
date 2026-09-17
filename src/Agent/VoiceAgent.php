@@ -4,6 +4,8 @@ namespace EasyAI\LaravelVoice\Agent;
 
 use EasyAI\LaravelAI\Chat\Models\ChatMessage;
 use EasyAI\LaravelAI\Facades\AI;
+use EasyAI\LaravelVoice\Events\HandoffCompleted;
+use EasyAI\LaravelVoice\Events\HandoffRequested;
 use EasyAI\LaravelVoice\Events\ResponseChunkReceived;
 use EasyAI\LaravelVoice\Events\ResponseSynthesized;
 use EasyAI\LaravelVoice\Events\SessionEnded;
@@ -16,6 +18,7 @@ use EasyAI\LaravelVoice\Exceptions\VoiceException;
 use EasyAI\LaravelVoice\Exceptions\VoiceLimitExceededException;
 use EasyAI\LaravelVoice\Models\VoiceSession;
 use EasyAI\LaravelVoice\Models\VoiceTurn;
+use EasyAI\LaravelVoice\Support\CurrentVoiceSession;
 use EasyAI\LaravelVoice\VoiceManager;
 
 class VoiceAgent
@@ -149,6 +152,43 @@ class VoiceAgent
     }
 
     /**
+     * Signals that a human should take over - typically called from a
+     * tool's handler once the agent recognizes it cannot resolve the
+     * request. Does not end the session by itself (the human may keep
+     * talking to the same caller through a different channel this
+     * package doesn't manage yet) - call completeHandoff() once the
+     * handoff has actually happened.
+     */
+    public function requestHandoff(VoiceSession $session, string $reason = ''): void
+    {
+        event(new HandoffRequested($session, $reason));
+    }
+
+    /**
+     * Ends the session with the handoff reason recorded in its metadata,
+     * rather than a dedicated status value - adding a new
+     * voice_sessions.status enum member would need a raw, per-database
+     * ALTER statement this package cannot safely verify against every
+     * supported database engine. 'ended' plus metadata carries the same
+     * information a host app needs to tell a handed-off session apart
+     * from a normal one, without that risk.
+     */
+    public function completeHandoff(VoiceSession $session, string $reason = ''): void
+    {
+        $session->update([
+            'status' => 'ended',
+            'ended_at' => now(),
+            'metadata' => array_merge($session->metadata ?? [], [
+                'handoff' => true,
+                'handoff_reason' => $reason,
+            ]),
+        ]);
+
+        event(new HandoffCompleted($session, $reason));
+        event(new SessionEnded($session));
+    }
+
+    /**
      * Runs one full voice turn: STT -> EasyAI agent loop (with tools) ->
      * TTS. Persists a user VoiceTurn and an assistant VoiceTurn, firing
      * events at each stage. A failure at any stage is recorded on the
@@ -230,29 +270,40 @@ class VoiceAgent
                 }
                 : null;
 
-            $response = $provider->run($messages, $this->maxSteps, function ($call, $result) use ($session, &$toolCallLog) {
-                // run()'s callback only ever hands back the ToolCall/result,
-                // never the matched Tool instance - looked up here by name
-                // against this agent's own $this->tools so an
-                // AuthorizedTool-made tool's tier can be surfaced on both
-                // events.
-                $tier = null;
-                foreach ($this->tools as $tool) {
-                    if ($tool->name === $call->name) {
-                        $tier = AuthorizedTool::tierOf($tool);
-                        break;
+            // Exposes the active session to a tool's handler for the exact
+            // duration of this call - Tool::execute() only ever receives
+            // the LLM's parsed arguments, with no way to pass session
+            // context through it otherwise. See CurrentVoiceSession's own
+            // docblock for why this exists (the memory tools need it).
+            CurrentVoiceSession::set($session);
+
+            try {
+                $response = $provider->run($messages, $this->maxSteps, function ($call, $result) use ($session, &$toolCallLog) {
+                    // run()'s callback only ever hands back the ToolCall/result,
+                    // never the matched Tool instance - looked up here by name
+                    // against this agent's own $this->tools so an
+                    // AuthorizedTool-made tool's tier can be surfaced on both
+                    // events.
+                    $tier = null;
+                    foreach ($this->tools as $tool) {
+                        if ($tool->name === $call->name) {
+                            $tier = AuthorizedTool::tierOf($tool);
+                            break;
+                        }
                     }
-                }
 
-                // AbstractDriver::run() only exposes a single post-execution
-                // hook - there is no separate pre-execution callback to fire
-                // ToolCallStarted from with accurate timing, so both events
-                // fire back-to-back here rather than pretending otherwise.
-                event(new ToolCallStarted($session, $call->name, $call->arguments, $tier));
-                event(new ToolCallCompleted($session, $call->name, $result, $tier));
+                    // AbstractDriver::run() only exposes a single post-execution
+                    // hook - there is no separate pre-execution callback to fire
+                    // ToolCallStarted from with accurate timing, so both events
+                    // fire back-to-back here rather than pretending otherwise.
+                    event(new ToolCallStarted($session, $call->name, $call->arguments, $tier));
+                    event(new ToolCallCompleted($session, $call->name, $result, $tier));
 
-                $toolCallLog[] = ['name' => $call->name, 'arguments' => $call->arguments, 'tier' => $tier];
-            }, $onChunk);
+                    $toolCallLog[] = ['name' => $call->name, 'arguments' => $call->arguments, 'tier' => $tier];
+                }, $onChunk);
+            } finally {
+                CurrentVoiceSession::clear();
+            }
 
             $latencyMs = (int) round((microtime(true) - $started) * 1000);
 

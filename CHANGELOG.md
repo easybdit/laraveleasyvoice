@@ -1,12 +1,22 @@
 # Changelog
 
-## v0.1.0 — 2026-09-17
-
-Tagged and published to Packagist. Everything below this line shipped in that release. See the "Working toward v0.2" section above it for what's landed on `main` since.
-
 ## Unreleased — working toward v0.2
 
-Per-phase entries, same convention as v0.1's build-up — logged as work lands on `main`, tagged as a release only once enough has accumulated to justify a version bump (not after every phase).
+Per-phase entries, same convention as v0.1's build-up — logged as work lands on `main`, tagged as a release only once enough has accumulated to justify a version bump (not after every phase). See "v0.1.0" further down for what's already tagged and published.
+
+### 🤝 Phase 7: human handoff, cross-session memory, Deepgram/ElevenLabs providers, realtime contracts
+
+Six items, each scoped deliberately against this project's own rules rather than built to the fullest extent possible - see the individual notes below for where scope was intentionally cut back.
+
+1. **Human handoff** — `VoiceAgent::requestHandoff()` fires `HandoffRequested` without ending the session (a human may keep talking to the same caller through a channel this package doesn't manage); `completeHandoff()` ends it, recording the reason in `metadata` rather than a new status value. A `handed_off` enum member was the initially obvious design, but altering an already-published enum column safely requires a raw, per-database-engine `ALTER` statement (`doctrine/dbal` isn't a dependency, and this project's rules say not to add one without justification) that couldn't be verified against a real MySQL/Postgres instance in this environment — reusing `ended` + `metadata` delivers the identical capability with zero migration risk.
+
+2. **Cross-session memory** — a deliberately minimal `voice_memories` key-value table (same nullable tenant/user/guest-token identity columns as `voice_sessions`) plus two ready-made tools, `RememberFactTool`/`RecallFactTool`, an agent can opt into. This is the bounded version of Example 7 ("My name is Murad" now, "What's my name?" next week) — not the "real memory system" (retrieval, staleness, consent at scale) the v0.2 audit flagged as a genuinely hard sub-project neither package should rush into. Getting a tool's handler to know *which caller* it's running for required a real design decision: `Tool::execute(array $arguments)` has no way to pass session context through it (not this package's contract to change), so `VoiceAgent::handleTurn()` now binds the active session into the container for the exact duration of one `run()` call via a new `CurrentVoiceSession` helper — an ambient-context pattern, not a change to any public API surface. A session with no identity at all (no tenant, no user, no guest token) is refused rather than silently sharing one global row across every anonymous caller with the same key.
+
+3. **Deepgram (STT) and ElevenLabs (TTS)** — the second providers for each, after confirming their actual wire formats against current API documentation rather than assuming they'd match OpenAI's shape (they don't): Deepgram's `/v1/listen` takes the raw audio bytes as the request body with options as query parameters, not a multipart upload; ElevenLabs' endpoint path includes the voice id (`/v1/text-to-speech/{voice_id}`) and has no usable default voice, since ElevenLabs voices are per-account rather than fixed named voices like OpenAI's — `voice.tts.providers.elevenlabs.voice` must be set explicitly. Both follow the existing `Manager`-pattern registration (`createDeepgramDriver()`/`createElevenlabsDriver()`), so `Voice::stt('deepgram')`/`Voice::tts('elevenlabs')` work exactly like the OpenAI drivers do.
+
+4. **`RealtimeVoiceProvider`/`RealtimeConnection` contracts — design-stage only, explicitly not implemented.** No class in this package implements either interface; both docblocks say so plainly. This is deliberate, not incomplete: PHP-FPM's request/response model cannot hold a long-lived duplex connection, and *how* Laravel should host one at all (Octane+Reverb relaying in-process, an external relay service, or exposing the provider's own realtime endpoint to the browser with this package only minting a short-lived token) is an infrastructure decision for whoever adopts this, not something a contract should presume. Building working realtime infrastructure ahead of that decision — and ahead of stable contracts to build it against — is exactly what this project's own rules say not to do.
+
+15 new tests (handoff, memory — including a full agent-loop integration test proving a real tool call persists and later recalls a fact — and both new providers). 55 tests, 140 assertions, all passing.
 
 ### 🏗️ Phase 6: tenant enforcement, tool tiers, chat-history mirroring, usage tracking, and a real Cookbook
 
@@ -25,6 +35,10 @@ Five changes, sequenced by priority (highest-risk gap first), from an architectu
 6. **A real Cookbook in the README** — runnable patterns for the scenarios that already work today with zero new code (basic assistant, tool-calling, RAG via `AI::rag()`, tiered appointment booking, school receptionist composition, multilingual via per-call STT/TTS options, within-session memory, tenant-scoped SaaS) plus honest notes on what "multilingual" and "memory" do *not* yet mean (no auto-detection, no persistent cross-session fact store - neither package has one).
 
 9 new/expanded tests across tenant isolation, tool tiers, usage tracking, and the analytics service. 37 tests, 105 assertions, all passing.
+
+## v0.1.0 — 2026-09-17
+
+Tagged and published to Packagist. Everything from here down shipped in that release.
 
 ### 🛠️ Phase 5: `voice:install` and streaming responses — closing out the original v0.1 scope
 
@@ -90,6 +104,6 @@ Security decisions baked into this phase:
 
 10 tests, 16 assertions, all passing.
 
-### Deliberately not built yet
+### Deliberately not built yet (as of v0.1.0)
 
-No realtime/WebSocket transport, no interruption/barge-in, no telephony, no non-OpenAI providers. These are sequenced, not forgotten — each is a larger, harder-to-reverse decision (long-lived connections, provider lock-in, public phone numbers) than anything shipped so far, and gets designed and reviewed on its own rather than bundled in.
+No realtime/WebSocket transport, no interruption/barge-in, no telephony, no non-OpenAI providers. These are sequenced, not forgotten — each is a larger, harder-to-reverse decision (long-lived connections, provider lock-in, public phone numbers) than anything shipped so far, and gets designed and reviewed on its own rather than bundled in. (Deepgram/ElevenLabs providers and the realtime contracts landed in Phase 7, above; realtime transport, barge-in, and telephony are still open.)

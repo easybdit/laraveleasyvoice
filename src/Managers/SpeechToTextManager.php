@@ -2,6 +2,7 @@
 
 namespace EasyAI\LaravelVoice\Managers;
 
+use EasyAI\LaravelVoice\Providers\Stt\DeepgramSttProvider;
 use EasyAI\LaravelVoice\Providers\Stt\OpenAiSttProvider;
 use Illuminate\Support\Manager;
 
@@ -15,5 +16,10 @@ class SpeechToTextManager extends Manager
     protected function createOpenaiDriver(): OpenAiSttProvider
     {
         return new OpenAiSttProvider($this->config->get('voice.stt.providers.openai', []));
+    }
+
+    protected function createDeepgramDriver(): DeepgramSttProvider
+    {
+        return new DeepgramSttProvider($this->config->get('voice.stt.providers.deepgram', []));
     }
 }

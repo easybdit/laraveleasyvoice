@@ -35,6 +35,16 @@ return [
                 'retries' => env('VOICE_STT_RETRIES', 2),
                 'retry_sleep_ms' => env('VOICE_STT_RETRY_SLEEP_MS', 250),
             ],
+
+            'deepgram' => [
+                'api_key' => env('VOICE_DEEPGRAM_API_KEY'),
+                'url' => env('VOICE_DEEPGRAM_BASE_URL', 'https://api.deepgram.com/v1'),
+                'model' => env('VOICE_DEEPGRAM_STT_MODEL', 'nova-2'),
+                'timeout' => env('VOICE_DEEPGRAM_STT_TIMEOUT', 60),
+                'max_file_size' => env('VOICE_STT_MAX_FILE_SIZE', 25 * 1024 * 1024),
+                'retries' => env('VOICE_STT_RETRIES', 2),
+                'retry_sleep_ms' => env('VOICE_STT_RETRY_SLEEP_MS', 250),
+            ],
         ],
     ],
 
@@ -58,6 +68,24 @@ return [
                 // OpenAI's own per-request input cap.
                 'max_input_length' => env('VOICE_TTS_MAX_INPUT_LENGTH', 4096),
 
+                'retries' => env('VOICE_TTS_RETRIES', 2),
+                'retry_sleep_ms' => env('VOICE_TTS_RETRY_SLEEP_MS', 250),
+            ],
+
+            'elevenlabs' => [
+                'api_key' => env('VOICE_ELEVENLABS_API_KEY'),
+                'url' => env('VOICE_ELEVENLABS_BASE_URL', 'https://api.elevenlabs.io/v1'),
+                'model' => env('VOICE_ELEVENLABS_MODEL', 'eleven_multilingual_v2'),
+
+                // No usable default - ElevenLabs voice ids are per-account
+                // (cloned/library voices), unlike OpenAI's fixed named
+                // voices. Must be set explicitly, or passed as the
+                // "voice" option per call.
+                'voice' => env('VOICE_ELEVENLABS_VOICE_ID'),
+
+                'format' => env('VOICE_ELEVENLABS_FORMAT', 'mp3_44100_128'),
+                'timeout' => env('VOICE_ELEVENLABS_TIMEOUT', 60),
+                'max_input_length' => env('VOICE_ELEVENLABS_MAX_INPUT_LENGTH', 5000),
                 'retries' => env('VOICE_TTS_RETRIES', 2),
                 'retry_sleep_ms' => env('VOICE_TTS_RETRY_SLEEP_MS', 250),
             ],
