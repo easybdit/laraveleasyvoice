@@ -14,6 +14,12 @@ class VoiceSession extends Model
         'voice', 'language', 'channel', 'status', 'chat_session_id',
         'tenant_id', 'user_id', 'guest_token', 'started_at', 'ended_at',
         'metadata',
+        // Usage counters - written only by VoiceAgent itself (increment()
+        // already bypasses fillable for the integer columns, but
+        // accumulateCost()'s update() does not), never from raw request
+        // input, so including them here carries no mass-assignment risk.
+        'total_stt_ms', 'total_tts_ms', 'total_prompt_tokens',
+        'total_completion_tokens', 'estimated_cost',
     ];
 
     protected $casts = [

@@ -63,6 +63,29 @@ class VoiceIdentity
             : null;
     }
 
+    /**
+     * No default fallback here (unlike resolveUserId's $request->user()
+     * fallback) - there is no single Laravel convention for "current
+     * tenant" the way there is for "current user". Returns null unless
+     * voice.routes.tenant_resolver is explicitly configured.
+     */
+    public static function resolveTenant(Request $request): ?int
+    {
+        $resolver = config('voice.routes.tenant_resolver');
+
+        if (! $resolver || ! is_callable($resolver)) {
+            return null;
+        }
+
+        try {
+            $resolved = $resolver($request);
+        } catch (\Throwable) {
+            return null;
+        }
+
+        return $resolved !== null && $resolved !== '' ? (int) $resolved : null;
+    }
+
     public static function ensureGuestToken(?string $existing): string
     {
         if ($existing) {

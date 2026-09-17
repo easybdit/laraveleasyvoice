@@ -6,14 +6,14 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/status-pre--release%20(v0.1%20complete)-orange?style=flat-square" alt="Status">
+  <img src="https://img.shields.io/packagist/v/easybdit/laraveleasyvoice.svg?style=flat-square&label=version" alt="Latest Version">
   <img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="License">
   <img src="https://img.shields.io/badge/php-%5E8.1-777bb4?style=flat-square" alt="PHP Version">
 </p>
 
 ---
 
-> **Status: pre-release, v0.1 scope complete.** Not yet tagged or published to Packagist. This README documents what's actually implemented today — see [CHANGELOG.md](CHANGELOG.md) for the phase-by-phase build history and the reasoning behind each design decision.
+> **v0.1.0 is published on Packagist.** This README documents what's actually implemented today, including work that has landed on `main` since v0.1.0 tagged — see [CHANGELOG.md](CHANGELOG.md) for the phase-by-phase build history and the reasoning behind each design decision. Following v0.1's own cadence, `main` accumulates changes across several phases before the next version tag, rather than tagging every phase.
 
 ## Why LaravelEasyVoice?
 
@@ -91,6 +91,10 @@ Add a path repository to your own (uncommitted) local composer config rather tha
 - **HTTP routes (opt-in)** — `POST /voice/sessions`, `POST /voice/sessions/{id}/end`, `POST /voice/sessions/{id}/turns` (audio in, transcript + audio URL out), `GET /voice/sessions/{id}/turns/{turn}/audio`. See below.
 - **`php artisan voice:install`** — guided setup: publishes config/migrations, configures the OpenAI key, asks about the HTTP API.
 - **Streaming text responses (opt-in)** — `VoiceAgent::streamResponses()` fires a `ResponseChunkReceived` event per delta as the LLM's reply streams in, for showing text progressively before the full turn (including TTS) finishes.
+- **Multi-tenancy wiring** — `voice.routes.tenant_resolver` resolves the caller's tenant per request; every session-scoped HTTP route enforces it via `VoiceSession::isOwnedBy()`.
+- **Tool tiers** — `AuthorizedTool::make(..., tier: 'destructive')` (`read`/`write`/`destructive`/`privileged`) surfaces on `ToolCallStarted`/`ToolCallCompleted` for auditing, alongside the `Gate` check that actually authorizes the call.
+- **Chat-history mirroring (opt-in)** — link a session to an existing `ai_chat_sessions` row (`chat_session_id`) and every turn is also written to `ai_chat_messages`, so a voice call and a text chat can share one transcript.
+- **`Analytics\VoiceUsage`** — a query service over `voice_sessions`/`voice_turns` for aggregate or per-session usage (STT/TTS duration, tokens, estimated cost, latency), for building your own admin view or a future billing layer.
 
 With this, every item in the original v0.1 scope is implemented — see [CHANGELOG.md](CHANGELOG.md) for the full build history.
 
@@ -129,9 +133,119 @@ Event::listen(ResponseChunkReceived::class, function ($event) {
 
 Text only — TTS still synthesizes the complete reply once at the end of the turn, since none of the shipped TTS providers support streaming audio output. Full duplex audio streaming is a realtime-transport feature, tracked separately below.
 
+## Cookbook
+
+Real, runnable patterns for common voice-agent shapes. Everything below is composition of what's already documented above — none of it needed new package code, which is itself the point: LaravelEasyVoice orchestrates, LaravelEasyAI thinks.
+
+**Basic voice assistant**
+
+```php
+Voice::registerAgent('assistant', function ($agent) {
+    $agent->stt('openai')->tts('openai')->llm('openai')
+        ->systemPrompt('You are a helpful voice assistant. Keep replies short - they will be spoken aloud.');
+});
+```
+
+**Tool-calling (customer support: "Where is my order?")**
+
+```php
+Voice::registerAgent('support', function ($agent) {
+    $agent->stt('openai')->tts('openai')->llm('openai')->tools([
+        AuthorizedTool::make(
+            name: 'get_order_status',
+            description: 'Look up the shipping status of an order by its order number',
+            parameters: ['type' => 'object', 'properties' => [
+                'order_number' => ['type' => 'string'],
+            ], 'required' => ['order_number']],
+            ability: 'view-own-orders',
+            handler: fn (array $args) => Order::where('number', $args['order_number'])
+                ->where('user_id', auth()->id()) // never trust the model to scope this itself
+                ->firstOrFail()
+                ->only(['status', 'estimated_delivery']),
+        ),
+    ]);
+});
+```
+
+**RAG voice agent ("What is the admission policy?")** — no new API, just call `AI::rag()` from inside a tool or bake it into the system prompt per turn:
+
+```php
+Voice::registerAgent('school-info', function ($agent) {
+    $agent->stt('openai')->tts('openai')->llm('openai')->tools([
+        AuthorizedTool::make(
+            name: 'search_school_policies',
+            description: 'Search the school knowledge base (admissions, fees, routine, policies)',
+            parameters: ['type' => 'object', 'properties' => ['query' => ['type' => 'string']], 'required' => ['query']],
+            ability: 'view-public-info', // define this Gate to always allow - it's public information
+            handler: fn (array $args) => AI::rag()->source('school-kb')->search($args['query']),
+        ),
+    ]);
+});
+```
+
+**Appointment/booking, with read vs. destructive tools distinguished**
+
+```php
+Voice::registerAgent('booking', function ($agent) {
+    $agent->stt('openai')->tts('openai')->llm('openai')
+        ->systemPrompt('Before booking, always call check_availability first. Only call create_appointment after the user has explicitly confirmed the specific time.')
+        ->tools([
+            AuthorizedTool::make(
+                name: 'check_availability',
+                description: 'Check open appointment slots for a given date',
+                parameters: ['type' => 'object', 'properties' => ['date' => ['type' => 'string']], 'required' => ['date']],
+                ability: 'view-availability',
+                handler: fn (array $args) => Appointment::availableSlots($args['date']),
+                tier: AuthorizedTool::TIER_READ,
+            ),
+            AuthorizedTool::make(
+                name: 'create_appointment',
+                description: 'Book a confirmed appointment slot',
+                parameters: ['type' => 'object', 'properties' => [
+                    'date' => ['type' => 'string'], 'time' => ['type' => 'string'],
+                ], 'required' => ['date', 'time']],
+                ability: 'create-appointment',
+                handler: fn (array $args) => Appointment::book(auth()->id(), $args['date'], $args['time']),
+                tier: AuthorizedTool::TIER_WRITE,
+            ),
+        ]);
+});
+```
+
+**School AI receptionist** — a single agent combining the RAG-info and booking patterns above, plus a couple more read-only tools (`check_attendance`, `get_class_routine`, `get_fee_status`), each gated by its own ability. No new capability needed; it's the same composition at a larger scale.
+
+**Multilingual** — pass the caller's language into both STT and TTS per call, and let the model reply in kind:
+
+```php
+$agent->handleTurn($session, $audioPath, [
+    'stt' => ['language' => 'bn'],       // ISO-639-1: bn, en, hi, ur, ar, ...
+    'tts' => ['voice' => 'alloy'],
+]);
+```
+
+```php
+Voice::registerAgent('multilingual', function ($agent) {
+    $agent->stt('openai')->tts('openai')->llm('openai')
+        ->systemPrompt('Always reply in the same language the user spoke in.');
+});
+```
+
+Automatic language *detection* (rather than the caller specifying it) isn't built - Whisper can auto-detect if `language` is omitted, but nothing here inspects the transcript to switch the reply language or TTS voice automatically yet.
+
+**Memory** — within one session, prior turns are already included as context (`contextTurns()`, default 10) — "My name is Murad" followed by "What's my name?" works today as long as both are in the same call. Persisting that across separate sessions (a caller phoning back next week) isn't built - link `chat_session_id` to reuse LaravelEasyAI's own bounded chat history across channels, but note that's the *same kind* of context window, not a true long-term fact store; neither package has one of those yet.
+
+**Tenant-scoped multi-agent SaaS**
+
+```php
+// config/voice.php (or .env-driven, same pattern as identity_resolver)
+'tenant_resolver' => fn ($request) => $request->user()?->current_tenant_id,
+```
+
+Every session created through the HTTP API now carries `tenant_id`, and `VoiceSession::isOwnedBy()` enforces it on every subsequent request to that session - a 403 for a mismatched tenant, not just a mismatched user.
+
 ## Not implemented yet
 
-No realtime/WebSocket transport, no barge-in/interruption, no telephony, no non-OpenAI STT/TTS providers. These are sequenced deliberately, not overlooked — each is a larger, harder-to-reverse decision (long-lived connections, provider lock-in, public phone numbers) than anything shipped so far, and gets designed and reviewed on its own. See [CHANGELOG.md](CHANGELOG.md) for the reasoning.
+No realtime/WebSocket transport, no barge-in/interruption, no human handoff, no browser widget/JS, no telephony, no non-OpenAI STT/TTS providers, no persistent cross-session memory (a real fact store, not a context window). These are sequenced deliberately, not overlooked — each is a larger, harder-to-reverse decision (long-lived connections, provider lock-in, public phone numbers, a specific widget API tied to whichever realtime transport comes first) than anything shipped so far, and gets designed and reviewed on its own. See [CHANGELOG.md](CHANGELOG.md) for the reasoning.
 
 ## Security & Trust
 
@@ -143,7 +257,7 @@ This package assumes it will run in front of real, paid, third-party APIs and ha
 - **No SSRF surface.** STT only ever reads a local file path you already control; there is no remote-URL ingestion anywhere in this package.
 - **Size limits before network calls.** Both STT (file size) and TTS (text length) reject oversized input before making any outbound request.
 - **Private storage by default.** Synthesized audio is written to `voice.storage.disk` (default `local`), never a public disk.
-- **No invented tenancy.** `tenant_id`/`user_id`/`guest_token` are nullable, FK-less columns — the same posture LaravelEasyAI itself takes — because this package cannot assume your app's user or tenant model.
+- **No invented tenancy, but real enforcement once you plug in a resolver.** `tenant_id`/`user_id`/`guest_token` are nullable, FK-less columns — the same posture LaravelEasyAI itself takes, because this package cannot assume your app's tenant model — but once `voice.routes.tenant_resolver` is set, it's actually checked on every request, not just stored.
 - **Routes are opt-in and authenticated by default.** `voice.routes.enabled` defaults to `false`; once enabled, `auth` stays in the middleware list unless you deliberately remove it, and guest access needs a second, explicit flag (`voice.routes.allow_guest`) on top of that.
 - **Errors are redacted before they reach the client.** A provider-side failure over HTTP returns a generic "temporarily unavailable" message and a 502 — the real exception is still logged server-side via `report()`, never echoed back.
 - **Double-checked upload limits.** The HTTP layer validates file size/type before touching disk; the STT provider re-checks independently, so a bypassed or custom-built controller still can't push an oversized file through to a billed API call.

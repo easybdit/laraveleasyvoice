@@ -38,6 +38,13 @@ class OpenAiSttProvider implements SpeechToTextProvider
                     'model' => $options['model'] ?? $this->config['model'] ?? 'whisper-1',
                     'language' => $options['language'] ?? null,
                     'prompt' => $options['prompt'] ?? null,
+                    // verbose_json is the only response_format that returns
+                    // 'duration' - without it TranscriptionResult's
+                    // durationSeconds (and every usage/latency figure
+                    // downstream that relies on it) would silently stay
+                    // null forever. The 'text' field is present in both
+                    // formats, so nothing else about parsing changes.
+                    'response_format' => 'verbose_json',
                 ], fn ($value) => $value !== null));
 
             if (! $response->successful()) {
@@ -49,10 +56,13 @@ class OpenAiSttProvider implements SpeechToTextProvider
                 );
             }
 
+            $data = $response->json() ?? [];
+
             return new TranscriptionResult(
-                text: (string) ($response->json('text') ?? ''),
-                language: $options['language'] ?? null,
-                raw: $response->json() ?? [],
+                text: (string) ($data['text'] ?? ''),
+                language: $options['language'] ?? ($data['language'] ?? null),
+                durationSeconds: isset($data['duration']) ? (float) $data['duration'] : null,
+                raw: $data,
             );
         } catch (ProviderException $e) {
             throw $e;

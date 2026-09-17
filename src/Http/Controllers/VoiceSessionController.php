@@ -23,6 +23,7 @@ class VoiceSessionController extends Controller
         ]);
 
         [$userId, $guestToken] = VoiceIdentity::resolve($request);
+        $tenantId = VoiceIdentity::resolveTenant($request);
 
         if ($userId === null) {
             if (! config('voice.routes.allow_guest', false)) {
@@ -43,6 +44,7 @@ class VoiceSessionController extends Controller
         $session = $agent->startSession([
             'user_id' => $userId,
             'guest_token' => $guestToken,
+            'tenant_id' => $tenantId,
             'language' => $validated['language'] ?? null,
             'channel' => $validated['channel'] ?? 'web',
         ]);

@@ -10,6 +10,7 @@ final class ToolCallStarted
         public readonly VoiceSession $session,
         public readonly string $tool,
         public readonly array $arguments,
+        public readonly ?string $tier = null,
     ) {
     }
 }

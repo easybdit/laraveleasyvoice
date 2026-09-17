@@ -108,6 +108,16 @@ return [
         // through a container binding instead and reference the class name.
         'identity_resolver' => null,
 
+        // fn (\Illuminate\Http\Request $request): int|string|null - resolves
+        // the caller's tenant id for a multi-tenant host app. No default
+        // implementation is provided (unlike identity_resolver's
+        // $request->user() fallback) because there is no single Laravel
+        // convention for "current tenant" the way there is for "current
+        // user" - leave this null and every session's tenant_id stays
+        // null, same as leaving multi-tenancy entirely to the host app.
+        // Same config:cache caveat as identity_resolver above.
+        'tenant_resolver' => null,
+
         'throttle' => env('VOICE_ROUTES_THROTTLE', '30,1'),
 
         'max_upload_kb' => env('VOICE_ROUTES_MAX_UPLOAD_KB', 25600),

@@ -21,7 +21,11 @@ class SttProviderTest extends TestCase
     public function test_it_transcribes_audio_via_openai(): void
     {
         Http::fake([
-            'api.openai.com/v1/audio/transcriptions' => Http::response(['text' => 'hello world']),
+            'api.openai.com/v1/audio/transcriptions' => Http::response([
+                'text' => 'hello world',
+                'language' => 'english',
+                'duration' => 2.5,
+            ]),
         ]);
 
         $path = $this->makeTempAudioFile();
@@ -31,8 +35,16 @@ class SttProviderTest extends TestCase
 
             $this->assertInstanceOf(TranscriptionResult::class, $result);
             $this->assertSame('hello world', $result->text);
+            $this->assertSame(2.5, $result->durationSeconds);
 
-            Http::assertSent(fn ($request) => str_contains($request->url(), 'audio/transcriptions'));
+            // response_format=verbose_json is what actually makes OpenAI's
+            // API include 'duration' in the response at all - asserted
+            // here (against the raw multipart body, since Request::data()
+            // does not parse multipart fields) so a future refactor can't
+            // silently drop it.
+            Http::assertSent(fn ($request) => str_contains($request->url(), 'audio/transcriptions')
+                && str_contains($request->body(), 'name="response_format"')
+                && str_contains($request->body(), 'verbose_json'));
         } finally {
             unlink($path);
         }

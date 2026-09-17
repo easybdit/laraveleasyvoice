@@ -1,8 +1,30 @@
 # Changelog
 
-## Unreleased — working toward v0.1.0
+## v0.1.0 — 2026-09-17
 
-This package is pre-release: no tagged version, not yet on Packagist. Entries below are logged by build phase rather than version number until v0.1.0 ships, so the history of *why* each piece exists survives even though nothing has a tag yet.
+Tagged and published to Packagist. Everything below this line shipped in that release. See the "Working toward v0.2" section above it for what's landed on `main` since.
+
+## Unreleased — working toward v0.2
+
+Per-phase entries, same convention as v0.1's build-up — logged as work lands on `main`, tagged as a release only once enough has accumulated to justify a version bump (not after every phase).
+
+### 🏗️ Phase 6: tenant enforcement, tool tiers, chat-history mirroring, usage tracking, and a real Cookbook
+
+Five changes, sequenced by priority (highest-risk gap first), from an architecture audit against 16 real-world voice-agent scenarios (basic assistant, tool-calling, RAG, appointments, school receptionist, multilingual, memory, tenant-scoped SaaS, and forward-looking realtime/barge-in/handoff/telephony items intentionally left undesigned until their own phase).
+
+1. **Tenant enforcement was a live gap, not a missing feature.** `voice_sessions.tenant_id` has existed since v0.1.0's migration, and `VoiceSession::isOwnedBy()` already accepted an optional `$tenantId` — but nothing anywhere ever resolved or populated it, so a published package was carrying a schema that promised isolation it didn't enforce. Fixed: `voice.routes.tenant_resolver` (mirrors `identity_resolver`'s pattern, no default fallback since there's no Laravel-wide "current tenant" convention the way there is for "current user"), wired through `VoiceIdentity::resolveTenant()`, `VoiceSessionController::store()`, and `AuthorizesVoiceSession`. 3 new tests confirm the same authenticated user id under a different resolved tenant is denied, not just a different user id under the same tenant.
+
+2. **Tool tiers** — `AuthorizedTool::make(..., tier: 'read'|'write'|'destructive'|'privileged')`, surfaced on `ToolCallStarted`/`ToolCallCompleted` for auditing. Metadata only, deliberately: it does not add a second authorization mechanism alongside `Gate::allows()`, and a destructive action needing explicit confirmation is a documented handler pattern (a `confirm: true` argument the system prompt instructs the model to only set once the user has explicitly agreed), not new framework code. Implementation note: `AuthorizedTool::make()` is a published v0.1.0 API, so extending `Tool` as a subclass (the initially obvious approach) was rejected once it hit a real PHP constraint - a static method override must keep a compatible signature, and `Tool::make()`'s is fixed. A `WeakMap<Tool, string>` keyed by the `Tool` instance carries the tier alongside it instead, with zero risk of a memory leak once the `Tool` itself is no longer referenced anywhere, and `$tier` was appended as the *last* parameter (after the existing `$gateArguments`) specifically so no existing positional call site's arguments could silently shift meaning.
+
+3. **`chat_session_id` mirroring, actually implemented.** The nullable FK to `ai_chat_sessions` and the `chatSession()` relationship existed since v0.1.0's migration, but nothing ever wrote to `ai_chat_messages` — dead schema. `VoiceAgent::handleTurn()` now mirrors both sides of a completed exchange into LaravelEasyAI's own chat history when a session is linked, before TTS runs (so a synthesis failure never blocks the mirror).
+
+4. **Two usage-tracking columns were also dead schema, found while building the analytics service below** - `voice_sessions.total_stt_ms`/`total_tts_ms` and `estimated_cost` existed since v0.1.0 but were never populated. Root cause for STT: OpenAI's transcription endpoint only returns a `duration` field when called with `response_format=verbose_json`, which nothing was requesting - `TranscriptionResult::durationSeconds` had been silently null since day one. Fixed by requesting `verbose_json` (the `text` field a caller actually reads is present in both formats, so nothing else changes). Root cause for `estimated_cost`: it wasn't in `VoiceSession::$fillable`, so `update(['estimated_cost' => ...])` was being silently discarded by Eloquent's mass-assignment guard - found immediately once a real test asserted the accumulated value rather than just that the code ran without error. TTS duration remains unpopulated - OpenAI's speech endpoint returns raw audio bytes with no duration metadata at all, and estimating it from an undecoded MP3's bitrate would be a guess this project's own rules say not to make; documented as a known limitation rather than silently left broken.
+
+5. **`Analytics\VoiceUsage`** — a query service (not a new table) over `voice_sessions`/`voice_turns` for aggregate (`summary()`, filterable) or per-session (`forSession()`) usage: STT/TTS duration, tokens, estimated cost, turn counts, average assistant latency. Deliberately no materialized rollup table added speculatively - only justified later if a real query-performance problem shows up.
+
+6. **A real Cookbook in the README** — runnable patterns for the scenarios that already work today with zero new code (basic assistant, tool-calling, RAG via `AI::rag()`, tiered appointment booking, school receptionist composition, multilingual via per-call STT/TTS options, within-session memory, tenant-scoped SaaS) plus honest notes on what "multilingual" and "memory" do *not* yet mean (no auto-detection, no persistent cross-session fact store - neither package has one).
+
+9 new/expanded tests across tenant isolation, tool tiers, usage tracking, and the analytics service. 37 tests, 105 assertions, all passing.
 
 ### 🛠️ Phase 5: `voice:install` and streaming responses — closing out the original v0.1 scope
 

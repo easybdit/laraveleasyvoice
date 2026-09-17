@@ -9,6 +9,7 @@ use EasyAI\LaravelVoice\Events\SessionEnded;
 use EasyAI\LaravelVoice\Events\SessionStarted;
 use EasyAI\LaravelVoice\Events\SpeechTranscribed;
 use EasyAI\LaravelVoice\Events\ToolCallCompleted;
+use EasyAI\LaravelVoice\Events\ToolCallStarted;
 use EasyAI\LaravelVoice\Exceptions\VoiceLimitExceededException;
 use EasyAI\LaravelVoice\Facades\Voice;
 use EasyAI\LaravelVoice\Tests\TestCase;
@@ -110,6 +111,7 @@ class VoiceAgentTest extends TestCase
                     parameters: ['type' => 'object', 'properties' => []],
                     ability: 'view-attendance',
                     handler: fn (array $args) => ['present' => 42],
+                    tier: AuthorizedTool::TIER_READ,
                 ),
             ]);
         });
@@ -151,10 +153,15 @@ class VoiceAgentTest extends TestCase
         $this->assertSame('42 students are present today.', $assistantTurn->transcript);
         $this->assertNotEmpty($assistantTurn->tool_calls);
         $this->assertSame('check_attendance', $assistantTurn->tool_calls[0]['name']);
+        $this->assertSame(AuthorizedTool::TIER_READ, $assistantTurn->tool_calls[0]['tier']);
 
         Event::assertDispatched(ToolCallCompleted::class, function (ToolCallCompleted $event) {
-            return $event->tool === 'check_attendance' && $event->result === ['present' => 42];
+            return $event->tool === 'check_attendance'
+                && $event->result === ['present' => 42]
+                && $event->tier === AuthorizedTool::TIER_READ;
         });
+
+        Event::assertDispatched(ToolCallStarted::class, fn (ToolCallStarted $event) => $event->tier === AuthorizedTool::TIER_READ);
     }
 
     public function test_it_ends_the_session_and_blocks_further_turns_once_the_limit_is_reached(): void
@@ -235,5 +242,84 @@ class VoiceAgentTest extends TestCase
         }
 
         Event::assertNotDispatched(ResponseChunkReceived::class);
+    }
+
+    public function test_it_tracks_stt_duration_and_estimated_cost_on_the_session(): void
+    {
+        config(['ai.pricing.openai.gpt-4o-mini' => ['input' => 0.01, 'output' => 0.03]]);
+
+        Http::fake([
+            'api.openai.com/v1/audio/transcriptions' => Http::response([
+                'text' => 'What is the admission policy?',
+                'duration' => 3.2,
+            ]),
+            'api.openai.com/v1/chat/completions' => Http::response([
+                'model' => 'gpt-4o-mini',
+                'choices' => [['message' => ['content' => 'Open enrollment.']]],
+                'usage' => ['prompt_tokens' => 1000, 'completion_tokens' => 1000],
+            ]),
+            'api.openai.com/v1/audio/speech' => Http::response('binary-audio-bytes', 200, ['Content-Type' => 'audio/mpeg']),
+        ]);
+
+        $agent = Voice::agent('receptionist');
+        $session = $agent->startSession(['user_id' => 1]);
+        $audioPath = $this->makeTempAudioFile();
+
+        try {
+            $agent->handleTurn($session, $audioPath);
+        } finally {
+            unlink($audioPath);
+        }
+
+        $session->refresh();
+        $this->assertSame(3200, $session->total_stt_ms);
+        // 1000 prompt tokens @ $0.01/1k + 1000 completion tokens @ $0.03/1k
+        $this->assertEqualsWithDelta(0.04, $session->estimated_cost, 0.0001);
+    }
+
+    public function test_it_mirrors_turns_into_a_linked_chat_session(): void
+    {
+        $chatSession = \EasyAI\LaravelAI\Chat\Models\ChatSession::create(['title' => 'Linked chat']);
+
+        $this->fakeChatCompletion('The admission policy is open enrollment.');
+
+        $agent = Voice::agent('receptionist');
+        $session = $agent->startSession(['user_id' => 1, 'chat_session_id' => $chatSession->id]);
+        $audioPath = $this->makeTempAudioFile();
+
+        try {
+            $agent->handleTurn($session, $audioPath);
+        } finally {
+            unlink($audioPath);
+        }
+
+        $this->assertDatabaseHas('ai_chat_messages', [
+            'chat_session_id' => $chatSession->id,
+            'role' => 'user',
+            'content' => 'What is the admission policy?',
+        ]);
+
+        $this->assertDatabaseHas('ai_chat_messages', [
+            'chat_session_id' => $chatSession->id,
+            'role' => 'assistant',
+            'content' => 'The admission policy is open enrollment.',
+        ]);
+    }
+
+    public function test_it_does_not_mirror_when_no_chat_session_is_linked(): void
+    {
+        $this->fakeChatCompletion('Some reply.');
+
+        $agent = Voice::agent('receptionist');
+        $session = $agent->startSession(['user_id' => 1]);
+        $audioPath = $this->makeTempAudioFile();
+
+        try {
+            $agent->handleTurn($session, $audioPath);
+        } finally {
+            unlink($audioPath);
+        }
+
+        $this->assertDatabaseCount('ai_chat_messages', 0);
     }
 }

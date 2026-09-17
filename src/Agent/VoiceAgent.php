@@ -2,6 +2,7 @@
 
 namespace EasyAI\LaravelVoice\Agent;
 
+use EasyAI\LaravelAI\Chat\Models\ChatMessage;
 use EasyAI\LaravelAI\Facades\AI;
 use EasyAI\LaravelVoice\Events\ResponseChunkReceived;
 use EasyAI\LaravelVoice\Events\ResponseSynthesized;
@@ -177,13 +178,19 @@ class VoiceAgent
             throw $e;
         }
 
+        $sttDurationMs = $transcription->durationSeconds !== null
+            ? (int) round($transcription->durationSeconds * 1000)
+            : null;
+
         $userTurn->update([
             'transcript' => $transcription->text,
-            'audio_duration_ms' => $transcription->durationSeconds !== null
-                ? (int) round($transcription->durationSeconds * 1000)
-                : null,
+            'audio_duration_ms' => $sttDurationMs,
             'status' => 'completed',
         ]);
+
+        if ($sttDurationMs !== null) {
+            $session->increment('total_stt_ms', $sttDurationMs);
+        }
 
         event(new SpeechTranscribed($session, $userTurn));
 
@@ -224,14 +231,27 @@ class VoiceAgent
                 : null;
 
             $response = $provider->run($messages, $this->maxSteps, function ($call, $result) use ($session, &$toolCallLog) {
+                // run()'s callback only ever hands back the ToolCall/result,
+                // never the matched Tool instance - looked up here by name
+                // against this agent's own $this->tools so an
+                // AuthorizedTool-made tool's tier can be surfaced on both
+                // events.
+                $tier = null;
+                foreach ($this->tools as $tool) {
+                    if ($tool->name === $call->name) {
+                        $tier = AuthorizedTool::tierOf($tool);
+                        break;
+                    }
+                }
+
                 // AbstractDriver::run() only exposes a single post-execution
                 // hook - there is no separate pre-execution callback to fire
                 // ToolCallStarted from with accurate timing, so both events
                 // fire back-to-back here rather than pretending otherwise.
-                event(new ToolCallStarted($session, $call->name, $call->arguments));
-                event(new ToolCallCompleted($session, $call->name, $result));
+                event(new ToolCallStarted($session, $call->name, $call->arguments, $tier));
+                event(new ToolCallCompleted($session, $call->name, $result, $tier));
 
-                $toolCallLog[] = ['name' => $call->name, 'arguments' => $call->arguments];
+                $toolCallLog[] = ['name' => $call->name, 'arguments' => $call->arguments, 'tier' => $tier];
             }, $onChunk);
 
             $latencyMs = (int) round((microtime(true) - $started) * 1000);
@@ -245,6 +265,9 @@ class VoiceAgent
 
             $session->increment('total_prompt_tokens', $response->getPromptTokens());
             $session->increment('total_completion_tokens', $response->getCompletionTokens());
+            $this->accumulateCost($session, $response->getEstimatedCost());
+
+            $this->mirrorIntoChatHistory($session, $userTurn, $assistantTurn);
         } catch (\Throwable $e) {
             $assistantTurn->update(['status' => 'failed', 'error_message' => $e->getMessage()]);
             event(new VoiceError($session, 'llm', $e));
@@ -256,12 +279,18 @@ class VoiceAgent
             $audio = $this->voice->tts($this->ttsDriver)->synthesize($assistantTurn->transcript, $options['tts'] ?? []);
             $path = $this->storeAudio($session, $assistantTurn, $audio);
 
+            $ttsDurationMs = $audio->durationSeconds !== null
+                ? (int) round($audio->durationSeconds * 1000)
+                : null;
+
             $assistantTurn->update([
                 'audio_path' => $path,
-                'audio_duration_ms' => $audio->durationSeconds !== null
-                    ? (int) round($audio->durationSeconds * 1000)
-                    : null,
+                'audio_duration_ms' => $ttsDurationMs,
             ]);
+
+            if ($ttsDurationMs !== null) {
+                $session->increment('total_tts_ms', $ttsDurationMs);
+            }
 
             event(new ResponseSynthesized($session, $assistantTurn));
         } catch (\Throwable $e) {
@@ -273,6 +302,49 @@ class VoiceAgent
         }
 
         return $assistantTurn->refresh();
+    }
+
+    /**
+     * Adds this exchange to EasyAI's own chat history when the session is
+     * explicitly linked to one (voice_sessions.chat_session_id) - opt-in,
+     * off by default. Lets a voice call and a text chat share one
+     * transcript/memory window in EasyAI's UI, without this package
+     * maintaining a second conversation store. Runs before TTS so a
+     * synthesis failure never prevents the exchange from being recorded.
+     */
+    protected function mirrorIntoChatHistory(VoiceSession $session, VoiceTurn $userTurn, VoiceTurn $assistantTurn): void
+    {
+        if ($session->chat_session_id === null) {
+            return;
+        }
+
+        ChatMessage::create([
+            'chat_session_id' => $session->chat_session_id,
+            'role' => 'user',
+            'content' => (string) $userTurn->transcript,
+        ]);
+
+        ChatMessage::create([
+            'chat_session_id' => $session->chat_session_id,
+            'role' => 'assistant',
+            'content' => (string) $assistantTurn->transcript,
+        ]);
+    }
+
+    /**
+     * getEstimatedCost() returns null unless ai.pricing.{provider}.{model}
+     * is configured (EasyAI never guesses a price) - accumulated manually
+     * rather than via increment() because SQL's `NULL + amount` evaluates
+     * to NULL, which would leave voice_sessions.estimated_cost stuck at
+     * NULL forever the first time a null was ever added to it.
+     */
+    protected function accumulateCost(VoiceSession $session, ?float $cost): void
+    {
+        if ($cost === null) {
+            return;
+        }
+
+        $session->update(['estimated_cost' => ($session->estimated_cost ?? 0) + $cost]);
     }
 
     protected function guardSessionIsUsable(VoiceSession $session): void
