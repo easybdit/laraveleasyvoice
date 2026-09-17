@@ -165,7 +165,13 @@ class VoiceRealtimeSession {
             });
 
             if (!sdpResponse.ok) {
-                throw new Error(`OpenAI realtime connection failed (HTTP ${sdpResponse.status}).`);
+                // OpenAI's error body here is worth surfacing, not
+                // discarding - a 429 in particular means either genuine
+                // rate-limiting or "insufficient quota / no billing set
+                // up", and only the body text tells you which.
+                const detail = await sdpResponse.text().catch(() => '');
+
+                throw new Error(`OpenAI realtime connection failed (HTTP ${sdpResponse.status})${detail ? `: ${detail}` : '.'}`);
             }
 
             const answerSdp = await sdpResponse.text();
