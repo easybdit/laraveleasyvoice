@@ -3,6 +3,7 @@
 namespace EasyAI\LaravelVoice\Tests\Feature;
 
 use EasyAI\LaravelVoice\Agent\AuthorizedTool;
+use EasyAI\LaravelVoice\Events\ResponseChunkReceived;
 use EasyAI\LaravelVoice\Events\ResponseSynthesized;
 use EasyAI\LaravelVoice\Events\SessionEnded;
 use EasyAI\LaravelVoice\Events\SessionStarted;
@@ -180,5 +181,59 @@ class VoiceAgentTest extends TestCase
         $this->assertSame('ended', $session->status);
 
         Event::assertDispatched(SessionEnded::class);
+    }
+
+    public function test_streaming_fires_a_chunk_event_per_delta_and_still_persists_the_full_reply(): void
+    {
+        Event::fake();
+
+        Http::fake([
+            'api.openai.com/v1/audio/transcriptions' => Http::response(['text' => 'Tell me a short greeting.']),
+            'api.openai.com/v1/audio/speech' => Http::response('binary-audio-bytes', 200, ['Content-Type' => 'audio/mpeg']),
+            'api.openai.com/v1/chat/completions' => Http::response(
+                "data: {\"model\":\"gpt-4o-mini\",\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n".
+                "data: {\"model\":\"gpt-4o-mini\",\"choices\":[{\"delta\":{\"content\":\" there!\"}}]}\n\n".
+                "data: [DONE]\n\n",
+                200,
+                ['Content-Type' => 'text/event-stream']
+            ),
+        ]);
+
+        Voice::registerAgent('streaming-bot', function ($agent) {
+            $agent->stt('openai')->tts('openai')->llm('openai')->streamResponses();
+        });
+
+        $agent = Voice::agent('streaming-bot');
+        $session = $agent->startSession(['user_id' => 1]);
+        $audioPath = $this->makeTempAudioFile();
+
+        try {
+            $assistantTurn = $agent->handleTurn($session, $audioPath);
+        } finally {
+            unlink($audioPath);
+        }
+
+        $this->assertSame('Hi there!', $assistantTurn->transcript);
+
+        Event::assertDispatched(ResponseChunkReceived::class, fn (ResponseChunkReceived $e) => $e->chunk === 'Hi');
+        Event::assertDispatched(ResponseChunkReceived::class, fn (ResponseChunkReceived $e) => $e->chunk === ' there!');
+    }
+
+    public function test_streaming_is_off_by_default_and_fires_no_chunk_events(): void
+    {
+        Event::fake();
+        $this->fakeChatCompletion('A plain, non-streamed reply.');
+
+        $agent = Voice::agent('receptionist'); // streamResponses() never called
+        $session = $agent->startSession(['user_id' => 1]);
+        $audioPath = $this->makeTempAudioFile();
+
+        try {
+            $agent->handleTurn($session, $audioPath);
+        } finally {
+            unlink($audioPath);
+        }
+
+        Event::assertNotDispatched(ResponseChunkReceived::class);
     }
 }

@@ -3,6 +3,7 @@
 namespace EasyAI\LaravelVoice\Agent;
 
 use EasyAI\LaravelAI\Facades\AI;
+use EasyAI\LaravelVoice\Events\ResponseChunkReceived;
 use EasyAI\LaravelVoice\Events\ResponseSynthesized;
 use EasyAI\LaravelVoice\Events\SessionEnded;
 use EasyAI\LaravelVoice\Events\SessionStarted;
@@ -35,6 +36,8 @@ class VoiceAgent
     protected int $maxSessionSeconds = 1800;
 
     protected int $contextTurns = 10;
+
+    protected bool $streaming = false;
 
     public function __construct(protected string $name, protected VoiceManager $voice)
     {
@@ -98,6 +101,21 @@ class VoiceAgent
     public function contextTurns(int $turns): static
     {
         $this->contextTurns = $turns;
+
+        return $this;
+    }
+
+    /**
+     * When enabled, handleTurn() fires ResponseChunkReceived as the LLM's
+     * reply streams in, so a caller (a broadcast listener, an SSE
+     * endpoint) can show the text appearing progressively. This only
+     * affects the text response - TTS still only ever synthesizes the
+     * complete final text once the turn finishes, since none of the
+     * shipped TTS providers support streaming audio output.
+     */
+    public function streamResponses(bool $enabled = true): static
+    {
+        $this->streaming = $enabled;
 
         return $this;
     }
@@ -199,6 +217,12 @@ class VoiceAgent
             // callback, so they're accumulated here instead.
             $toolCallLog = [];
 
+            $onChunk = $this->streaming
+                ? function (string $chunk, string $type = 'content') use ($session, $assistantTurn) {
+                    event(new ResponseChunkReceived($session, $assistantTurn, $chunk, $type));
+                }
+                : null;
+
             $response = $provider->run($messages, $this->maxSteps, function ($call, $result) use ($session, &$toolCallLog) {
                 // AbstractDriver::run() only exposes a single post-execution
                 // hook - there is no separate pre-execution callback to fire
@@ -208,7 +232,7 @@ class VoiceAgent
                 event(new ToolCallCompleted($session, $call->name, $result));
 
                 $toolCallLog[] = ['name' => $call->name, 'arguments' => $call->arguments];
-            });
+            }, $onChunk);
 
             $latencyMs = (int) round((microtime(true) - $started) * 1000);
 

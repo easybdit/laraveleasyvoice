@@ -6,14 +6,14 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/status-pre--release%20(v0.1%20foundation)-orange?style=flat-square" alt="Status">
+  <img src="https://img.shields.io/badge/status-pre--release%20(v0.1%20complete)-orange?style=flat-square" alt="Status">
   <img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="License">
   <img src="https://img.shields.io/badge/php-%5E8.1-777bb4?style=flat-square" alt="PHP Version">
 </p>
 
 ---
 
-> **Status: pre-release.** Not yet tagged or published to Packagist. This README documents what's actually implemented today — see [CHANGELOG.md](CHANGELOG.md) for the phase-by-phase build history and the reasoning behind each design decision.
+> **Status: pre-release, v0.1 scope complete.** Not yet tagged or published to Packagist. This README documents what's actually implemented today — see [CHANGELOG.md](CHANGELOG.md) for the phase-by-phase build history and the reasoning behind each design decision.
 
 ## Why LaravelEasyVoice?
 
@@ -56,6 +56,13 @@ $assistantTurn = $agent->handleTurn($session, $uploadedAudioPath);
 
 ```bash
 composer require easybdit/laraveleasyvoice
+php artisan voice:install
+```
+
+`voice:install` publishes `config/voice.php`, runs migrations (with your confirmation), configures your OpenAI key (reusing `OPENAI_API_KEY` automatically if LaravelEasyAI already set one — no need to enter it twice), and asks whether to turn on the HTTP API. Prefer to do it by hand instead:
+
+```bash
+composer require easybdit/laraveleasyvoice
 php artisan vendor:publish --tag=voice-config
 php artisan migrate
 ```
@@ -82,6 +89,10 @@ Add a path repository to your own (uncommitted) local composer config rather tha
 - **Events** — `SessionStarted`, `SessionEnded`, `SpeechTranscribed`, `ToolCallStarted`, `ToolCallCompleted`, `ResponseSynthesized`, `VoiceError`, all fired through Laravel's own `Event` facade.
 - **`AuthorizedTool`** — a tool wrapper that structurally requires a `Gate` ability check before its handler ever runs, failing closed on denial or an undecidable guest check.
 - **HTTP routes (opt-in)** — `POST /voice/sessions`, `POST /voice/sessions/{id}/end`, `POST /voice/sessions/{id}/turns` (audio in, transcript + audio URL out), `GET /voice/sessions/{id}/turns/{turn}/audio`. See below.
+- **`php artisan voice:install`** — guided setup: publishes config/migrations, configures the OpenAI key, asks about the HTTP API.
+- **Streaming text responses (opt-in)** — `VoiceAgent::streamResponses()` fires a `ResponseChunkReceived` event per delta as the LLM's reply streams in, for showing text progressively before the full turn (including TTS) finishes.
+
+With this, every item in the original v0.1 scope is implemented — see [CHANGELOG.md](CHANGELOG.md) for the full build history.
 
 ## HTTP API (opt-in, off by default)
 
@@ -99,6 +110,24 @@ POST /voice/sessions/1/end    {}                                  -> {"id": 1, "
 ```
 
 Every session-scoped route 403s for anyone who isn't the session's owner (`VoiceSession::isOwnedBy()`). To allow anonymous callers, set both `voice.routes.allow_guest = true` **and** remove `auth` from `voice.routes.middleware` — a long-lived signed cookie (separate from LaravelEasyAI's own guest cookie) identifies a returning guest, same pattern LaravelEasyAI uses for its chat widget, deliberately kept as an independent config surface so the two packages' access policies can never silently affect each other.
+
+## Streaming text responses (opt-in)
+
+```php
+Voice::registerAgent('receptionist', function ($agent) {
+    $agent->stt('openai')->tts('openai')->llm('openai')->streamResponses();
+});
+```
+
+```php
+Event::listen(ResponseChunkReceived::class, function ($event) {
+    // $event->chunk  -> the partial text delta
+    // $event->type   -> 'content' or 'thinking' (reasoning-capable models)
+    broadcast(new YourOwnBroadcastEvent($event->session->id, $event->chunk));
+});
+```
+
+Text only — TTS still synthesizes the complete reply once at the end of the turn, since none of the shipped TTS providers support streaming audio output. Full duplex audio streaming is a realtime-transport feature, tracked separately below.
 
 ## Not implemented yet
 

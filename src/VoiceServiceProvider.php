@@ -2,6 +2,7 @@
 
 namespace EasyAI\LaravelVoice;
 
+use EasyAI\LaravelVoice\Console\InstallCommand;
 use EasyAI\LaravelVoice\Managers\SpeechToTextManager;
 use EasyAI\LaravelVoice\Managers\TextToSpeechManager;
 use Illuminate\Support\Facades\Route;
@@ -45,6 +46,8 @@ class VoiceServiceProvider extends ServiceProvider
             $this->publishes([
                 __DIR__.'/../database/migrations' => database_path('migrations'),
             ], 'voice-migrations');
+
+            $this->commands([InstallCommand::class]);
         }
     }
 }
