@@ -6,7 +6,9 @@ Per-phase entries, same convention as v0.1's build-up — logged as work lands o
 
 ### 🔎 Phase 13: surface OpenAI's real error on a failed realtime connection
 
-Found during the first live browser test against a real OpenAI account: token minting succeeded, but the actual WebRTC handshake (`POST /v1/realtime/calls`) returned `HTTP 429` - and `VoiceRealtimeSession.connect()` was throwing away the response body, leaving only the status code to diagnose with. That matters specifically for `429`, which OpenAI overloads to mean either genuine rate-limiting *or* "insufficient quota / no billing configured" - the two have very different fixes, and only the response body text tells you which. Fixed: the body is now read and included in the thrown error. No test coverage possible here either, same reasoning as the rest of this file - this is browser-only error-path code.
+Found during the first live browser test against a real OpenAI account: token minting succeeded, but the actual WebRTC handshake (`POST /v1/realtime/calls`) returned `HTTP 429` - and `VoiceRealtimeSession.connect()` was throwing away the response body, leaving only the status code to diagnose with. That matters specifically for `429`, which OpenAI overloads to mean either genuine rate-limiting *or* "insufficient quota / no billing configured" - the two have very different fixes, and only the response body text tells you which. Fixed: the body is now read and included in the thrown error.
+
+Root cause confirmed on the same account, not left as a guess: `Credit remaining: $0.00` on that OpenAI account's own dashboard, "Add credits" still an unchecked setup step - token minting doesn't check balance, the metered connection does. Documented as its own troubleshooting entry in the README, since it's exactly the gotcha anyone else adopting this will hit on a fresh/low-balance OpenAI account. No test coverage possible for the JS fix itself, same reasoning as the rest of this file - this is browser-only error-path code.
 
 ### 🛠️ Phase 12: the realtime token endpoint, corrected against a real live OpenAI account
 
