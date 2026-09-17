@@ -29,6 +29,9 @@ class VoiceWidget {
      * @param {(transcript: string) => void} [options.onTranscript] - the caller's own transcribed speech.
      * @param {(turn: Object) => void} [options.onResponse] - the full turn response (transcript, audio_url, tool_calls).
      * @param {(error: Error) => void} [options.onError]
+     * @param {(level: number) => void} [options.onLevel] - live mic input level (0-1) while recording, ~30fps.
+     * @param {(level: number) => void} [options.onPlaybackLevel] - live playback level (0-1) while speaking, ~30fps.
+     * @param {(percent: number) => void} [options.onUploadProgress] - upload progress (0-100) while a turn uploads.
      */
     constructor(options = {}) {
         if (!options.agent) {
@@ -44,12 +47,20 @@ class VoiceWidget {
         this.onTranscript = options.onTranscript || (() => {});
         this.onResponse = options.onResponse || (() => {});
         this.onError = options.onError || (() => {});
+        this.onLevel = options.onLevel || (() => {});
+        this.onPlaybackLevel = options.onPlaybackLevel || (() => {});
+        this.onUploadProgress = options.onUploadProgress || (() => {});
 
         this.session = null;
         this.mediaRecorder = null;
         this.audioChunks = [];
         this.currentAudio = null;
         this.state = 'idle';
+
+        // Lazily created, reused for the lifetime of the widget - browsers
+        // cap how many AudioContexts can be alive at once.
+        this.audioContext = null;
+        this.levelMeterHandle = null;
     }
 
     static readCsrfTokenFromPage() {
@@ -75,6 +86,60 @@ class VoiceWidget {
         }
 
         return headers;
+    }
+
+    getAudioContext() {
+        if (!this.audioContext) {
+            const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+            this.audioContext = new AudioContextClass();
+        }
+
+        if (this.audioContext.state === 'suspended') {
+            this.audioContext.resume().catch(() => {});
+        }
+
+        return this.audioContext;
+    }
+
+    /**
+     * Wires an AnalyserNode onto an audio source and reports its RMS level
+     * (0-1) on every animation frame until stopLevelMeter() is called.
+     * Used for both the mic input (recording) and the reply audio (speaking).
+     */
+    startLevelMeter(sourceNode, callback) {
+        this.stopLevelMeter();
+
+        const analyser = this.getAudioContext().createAnalyser();
+        analyser.fftSize = 512;
+        analyser.smoothingTimeConstant = 0.75;
+        sourceNode.connect(analyser);
+
+        const data = new Uint8Array(analyser.frequencyBinCount);
+
+        const tick = () => {
+            analyser.getByteTimeDomainData(data);
+
+            let sumSquares = 0;
+            for (let i = 0; i < data.length; i++) {
+                const normalized = (data[i] - 128) / 128;
+                sumSquares += normalized * normalized;
+            }
+
+            callback(Math.min(1, Math.sqrt(sumSquares / data.length) * 4));
+
+            this.levelMeterHandle = requestAnimationFrame(tick);
+        };
+
+        this.levelMeterHandle = requestAnimationFrame(tick);
+
+        return analyser;
+    }
+
+    stopLevelMeter() {
+        if (this.levelMeterHandle !== null) {
+            cancelAnimationFrame(this.levelMeterHandle);
+            this.levelMeterHandle = null;
+        }
     }
 
     /** Starts a voice session. Must be called before recording. */
@@ -121,6 +186,13 @@ class VoiceWidget {
         });
         this.mediaRecorder.start();
         this.setState('recording');
+
+        try {
+            const micSource = this.getAudioContext().createMediaStreamSource(stream);
+            this.startLevelMeter(micSource, this.onLevel);
+        } catch (error) {
+            // Metering is a visual nicety only - never let it block recording.
+        }
     }
 
     /** Stops recording, uploads the turn, and plays the assistant's reply. */
@@ -131,6 +203,9 @@ class VoiceWidget {
 
                 return;
             }
+
+            this.stopLevelMeter();
+            this.onLevel(0);
 
             this.mediaRecorder.addEventListener('stop', () => {
                 this.mediaRecorder.stream.getTracks().forEach((track) => track.stop());
@@ -144,42 +219,68 @@ class VoiceWidget {
         });
     }
 
-    /** Uploads a recorded audio blob as one turn - called by stopRecording(), or directly with your own audio. */
-    async sendTurn(audioBlob) {
+    /**
+     * Uploads a recorded audio blob as one turn - called by stopRecording(),
+     * or directly with your own audio. Uses XMLHttpRequest rather than
+     * fetch() solely because fetch has no upload-progress event; everything
+     * else about the request/response contract is identical.
+     */
+    sendTurn(audioBlob) {
         this.setState('uploading');
+        this.onUploadProgress(0);
 
         const formData = new FormData();
         formData.append('audio', audioBlob, 'turn.webm');
 
-        try {
-            const response = await fetch(`${this.baseUrl}/sessions/${this.session.id}/turns`, {
-                method: 'POST',
-                credentials: 'same-origin',
-                headers: this.buildHeaders(),
-                body: formData,
+        return new Promise((resolve, reject) => {
+            const xhr = new XMLHttpRequest();
+            xhr.open('POST', `${this.baseUrl}/sessions/${this.session.id}/turns`);
+            xhr.withCredentials = true;
+            xhr.responseType = 'json';
+
+            const headers = this.buildHeaders();
+            Object.keys(headers).forEach((name) => xhr.setRequestHeader(name, headers[name]));
+
+            xhr.upload.addEventListener('progress', (event) => {
+                if (event.lengthComputable) {
+                    this.onUploadProgress(Math.round((event.loaded / event.total) * 100));
+                }
             });
 
-            const body = await response.json().catch(() => ({}));
+            xhr.addEventListener('load', () => {
+                const body = xhr.response || {};
 
-            if (!response.ok) {
-                throw new Error(body.error || `Turn failed (HTTP ${response.status}).`);
-            }
+                if (xhr.status < 200 || xhr.status >= 300) {
+                    const error = new Error(body.error || `Turn failed (HTTP ${xhr.status}).`);
+                    this.setState('ready');
+                    this.onError(error);
+                    reject(error);
 
-            this.onTranscript(body.transcript);
-            this.onResponse(body);
+                    return;
+                }
 
-            if (body.audio_url) {
-                this.play(body.audio_url);
-            } else {
+                this.onUploadProgress(100);
+                this.onTranscript(body.transcript);
+                this.onResponse(body);
+
+                if (body.audio_url) {
+                    this.play(body.audio_url);
+                } else {
+                    this.setState('ready');
+                }
+
+                resolve(body);
+            });
+
+            xhr.addEventListener('error', () => {
+                const error = new Error('Turn upload failed - check your connection.');
                 this.setState('ready');
-            }
+                this.onError(error);
+                reject(error);
+            });
 
-            return body;
-        } catch (error) {
-            this.setState('ready');
-            this.onError(error);
-            throw error;
-        }
+            xhr.send(formData);
+        });
     }
 
     /** Plays a turn's response audio, replacing anything currently playing. */
@@ -187,9 +288,18 @@ class VoiceWidget {
         this.stopSpeaking();
 
         this.currentAudio = new Audio(audioUrl);
+        this.currentAudio.crossOrigin = 'anonymous';
         this.currentAudio.addEventListener('ended', () => this.setState('ready'));
 
         this.setState('speaking');
+
+        try {
+            const playbackSource = this.getAudioContext().createMediaElementSource(this.currentAudio);
+            playbackSource.connect(this.getAudioContext().destination);
+            this.startLevelMeter(playbackSource, this.onPlaybackLevel);
+        } catch (error) {
+            // Metering is a visual nicety only - never let it block playback.
+        }
 
         this.currentAudio.play().catch((error) => {
             this.setState('ready');
@@ -207,6 +317,9 @@ class VoiceWidget {
             this.currentAudio.currentTime = 0;
             this.currentAudio = null;
         }
+
+        this.stopLevelMeter();
+        this.onPlaybackLevel(0);
 
         if (this.state === 'speaking') {
             this.setState('ready');

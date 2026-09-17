@@ -11,6 +11,10 @@
   <img src="https://img.shields.io/badge/php-%5E8.1-777bb4?style=flat-square" alt="PHP Version">
 </p>
 
+<p align="center">
+  Built by <a href="https://www.easyit.com.bd">Easy IT</a>
+</p>
+
 ---
 
 > **v0.1.0 is published on Packagist.** This README documents what's actually implemented today, including work that has landed on `main` since v0.1.0 tagged — see [CHANGELOG.md](CHANGELOG.md) for the phase-by-phase build history and the reasoning behind each design decision. Following v0.1's own cadence, `main` accumulates changes across several phases before the next version tag, rather than tagging every phase.
@@ -295,6 +299,11 @@ VOICE_ROUTES_ENABLED=true
       onStateChange: (state) => console.log('state:', state), // idle, starting, ready, recording, uploading, speaking, ended
       onResponse: (turn) => console.log('assistant said:', turn.transcript),
       onError: (error) => console.error(error),
+
+      // Optional - live feedback for a nicer UI, all off by default:
+      onLevel: (level) => {}, // 0-1 mic input amplitude, ~60fps, while recording
+      onPlaybackLevel: (level) => {}, // 0-1 reply-audio amplitude, ~60fps, while speaking
+      onUploadProgress: (percent) => {}, // 0-100 while the recorded turn uploads
   });
 
   const button = document.getElementById('talk');
@@ -309,6 +318,15 @@ VOICE_ROUTES_ENABLED=true
 ```
 
 Publish the widget file first: `php artisan vendor:publish --tag=voice-assets`. The widget only talks to this package's own HTTP API (already covered by the test suite above) — it ships no third-party code. `widget.stopSpeaking()` stops local playback immediately (a "stop talking" control), but note it is **not** server-side barge-in — see the note in the widget's own file, and "Realtime" below.
+
+The `uploading` state covers the entire server round-trip (upload + STT + the LLM turn + TTS), not just the HTTP upload itself - there's no separate "server is thinking" state, since how long each provider call takes varies per turn. To show that distinction in your own UI, watch for `onUploadProgress` reaching 100 while `onResponse`/`onTranscript` haven't fired yet - that gap *is* "still processing," without the widget guessing at a label for it.
+
+<details>
+<summary>Troubleshooting: "Turn failed" / a provider 401 that only happens through the browser, never from the CLI</summary>
+
+If `php artisan tinker` or `vendor/bin/phpunit` can reach your STT/TTS provider fine but the widget can't, check whether your `php artisan serve` process is older than your last `.env` edit. Laravel's `.env` loader does not override a variable that's already present in the process environment - if the shell you launched `serve` from had already exported an (empty or stale) value for one of these keys, `.env`'s value is silently ignored for the lifetime of that server process, even though `config:show`/tinker from a clean shell resolve it correctly. Restarting `php artisan serve` from a shell without that variable set fixes it.
+
+</details>
 
 **Realtime (ephemeral token only)**
 
