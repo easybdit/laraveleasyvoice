@@ -1,0 +1,48 @@
+{
+    "name": "easybdit/laraveleasyvoice",
+    "description": "AI Voice Agent capabilities for Laravel, built on top of easybdit/laraveleasyai (speech-to-text, text-to-speech, voice sessions, voice-enabled tool-calling agents).",
+    "keywords": [
+        "laravel", "ai", "voice", "voice-agent", "speech-to-text", "text-to-speech",
+        "stt", "tts", "openai", "realtime", "conversational-ai", "laravel-package"
+    ],
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Md Murad Hosen",
+            "email": "muradbd.info@gmail.com",
+            "homepage": "https://www.easyit.com.bd"
+        }
+    ],
+    "require": {
+        "php": "^8.1",
+        "easybdit/laraveleasyai": "^2.14",
+        "illuminate/support": "^9.0 || ^10.0 || ^11.0 || ^12.0 || ^13.0",
+        "illuminate/http": "^9.0 || ^10.0 || ^11.0 || ^12.0 || ^13.0"
+    },
+    "require-dev": {
+        "orchestra/testbench": "^7.0 || ^8.0 || ^9.0 || ^10.0 || ^11.0",
+        "phpunit/phpunit": "^9.5 || ^10.5 || ^11.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "EasyAI\\LaravelVoice\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "EasyAI\\LaravelVoice\\Tests\\": "tests/"
+        }
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "EasyAI\\LaravelVoice\\VoiceServiceProvider"
+            ],
+            "aliases": {
+                "Voice": "EasyAI\\LaravelVoice\\Facades\\Voice"
+            }
+        }
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true
+}

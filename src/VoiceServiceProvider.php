@@ -1,0 +1,50 @@
+<?php
+
+namespace EasyAI\LaravelVoice;
+
+use EasyAI\LaravelVoice\Managers\SpeechToTextManager;
+use EasyAI\LaravelVoice\Managers\TextToSpeechManager;
+use Illuminate\Support\Facades\Route;
+use Illuminate\Support\ServiceProvider;
+
+class VoiceServiceProvider extends ServiceProvider
+{
+    public function register(): void
+    {
+        $this->mergeConfigFrom(__DIR__.'/../config/voice.php', 'voice');
+
+        $this->app->singleton(SpeechToTextManager::class, fn ($app) => new SpeechToTextManager($app));
+        $this->app->singleton(TextToSpeechManager::class, fn ($app) => new TextToSpeechManager($app));
+
+        $this->app->singleton('laravel-voice', fn ($app) => new VoiceManager(
+            $app->make(SpeechToTextManager::class),
+            $app->make(TextToSpeechManager::class),
+        ));
+
+        $this->app->alias('laravel-voice', VoiceManager::class);
+    }
+
+    public function boot(): void
+    {
+        $this->loadMigrationsFrom(__DIR__.'/../database/migrations');
+
+        if (config('voice.routes.enabled', false)) {
+            $middleware = array_merge(
+                config('voice.routes.middleware', ['web', 'auth']),
+                ['throttle:'.config('voice.routes.throttle', '30,1')],
+            );
+
+            Route::middleware($middleware)->group(__DIR__.'/../routes/voice.php');
+        }
+
+        if ($this->app->runningInConsole()) {
+            $this->publishes([
+                __DIR__.'/../config/voice.php' => config_path('voice.php'),
+            ], 'voice-config');
+
+            $this->publishes([
+                __DIR__.'/../database/migrations' => database_path('migrations'),
+            ], 'voice-migrations');
+        }
+    }
+}
