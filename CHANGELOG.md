@@ -4,6 +4,22 @@
 
 Per-phase entries, same convention as v0.1's build-up — logged as work lands on `main`, tagged as a release only once enough has accumulated to justify a version bump (not after every phase). See "v0.1.0" further down for what's already tagged and published.
 
+### 📡 Phase 10: a real browser-direct realtime voice client
+
+Closes the biggest remaining gap without needing the infrastructure decision this project kept flagging (Octane+Reverb vs. an external relay) — because the browser-direct option was already half-built in Phase 8's token endpoint. The only missing piece was purely client-side: the actual WebRTC signaling.
+
+`resources/js/voice-realtime.js` (new, separate from `voice-widget.js` on purpose - a live duplex connection is a genuinely different concern from one-turn-at-a-time HTTP calls) - `VoiceRealtimeSession` mints a token via `/voice/realtime/token`, then opens an `RTCPeerConnection` **directly from the browser to OpenAI**; Laravel is never in the audio path, so `Contracts\RealtimeVoiceProvider`/`RealtimeConnection` (the PHP-mediated contracts) correctly remain exactly as unimplemented as before - this doesn't need them.
+
+Every endpoint/field/event name was verified against OpenAI's current API documentation before writing any code, the same discipline as the Phase 8 token endpoint: SDP offer/answer exchange at `POST https://api.openai.com/v1/realtime/calls` (`Authorization: Bearer <ephemeral token>`, `Content-Type: application/sdp`, raw SDP body, raw SDP answer response), a data channel labelled `oai-events` carrying JSON events (`session.update`, `conversation.item.create`, etc.), and `{"type": "response.cancel"}` as the explicit interrupt event.
+
+Two things stated honestly rather than glossed over, both directly in the file's own top comment (not just here):
+1. **OpenAI's server-side voice-activity detection already auto-interrupts a response by default** when it detects the caller speaking - `interrupt()` is a backstop "stop" control on top of that, not the only mechanism making this feel like a real conversation, and this package cannot claim credit for VAD behavior that's entirely OpenAI's.
+2. **This file cannot be exercised by `vendor/bin/phpunit`** - there is no way to open a real WebRTC connection or use real microphone/speaker hardware from a PHP test process. "Every fact verified against docs" is not the same claim as "tested against a live connection," and the two are kept clearly distinct in the README rather than blurred together. Community reports of occasional `response.cancel`/`conversation.item.truncate` reliability issues on OpenAI's own side are noted rather than hidden - this package surfaces whatever OpenAI's connection reports, it cannot fix OpenAI's API.
+
+One real bug found while preparing to test this against a real multi-provider setup (Together AI standing in for OpenAI's STT/TTS, per Phase 9's dogfooding): `voice.realtime.openai` reused `VOICE_OPENAI_API_KEY`/`VOICE_OPENAI_BASE_URL` - the same variables `voice.stt`/`voice.tts`'s "openai" provider entries use, which are meant to be pointed at any OpenAI-*compatible* endpoint. A host app that (reasonably) points those at Together for cost reasons would have silently sent its real OpenAI realtime traffic to Together too - which almost certainly doesn't implement OpenAI's proprietary Realtime API. Fixed before anyone hit it: `voice.realtime.openai` now has its own `VOICE_REALTIME_OPENAI_API_KEY`/`VOICE_REALTIME_OPENAI_BASE_URL`, falling back only to the bare `OPENAI_API_KEY`, never to the STT/TTS config - realtime always targets OpenAI's real API regardless of what the swappable STT/TTS providers are pointed at.
+
+No new PHP code beyond that config fix, no new tests (none of this touches the PHP side beyond publishing the new file via the existing `voice-assets` tag) - 59 tests, 152 assertions, still all passing.
+
 ### 🎚️ Phase 9: live level metering and upload progress on the widget
 
 Prompted by hands-on testing of Phase 8's widget against a real host app (Together AI for STT/TTS, a local Ollama model for the LLM): the widget's `uploading` state covered the entire server round-trip — upload, STT, the LLM turn, and TTS — with no visual distinction between "still sending bytes" and "server is thinking," and neither the mic input nor the reply playback had any live feedback beyond the state label. Three additions to `resources/js/voice-widget.js`, all additive and off by default (existing integrations are unaffected):

@@ -101,9 +101,9 @@ Add a path repository to your own (uncommitted) local composer config rather tha
 - **`Analytics\VoiceUsage`** — a query service over `voice_sessions`/`voice_turns` for aggregate or per-session usage (STT/TTS duration, tokens, estimated cost, latency), for building your own admin view or a future billing layer.
 - **Human handoff** — `VoiceAgent::requestHandoff()`/`completeHandoff()` fire `HandoffRequested`/`HandoffCompleted` events for notifying a human agent through whatever channel you already use.
 - **Cross-session memory (opt-in tools)** — `RememberFactTool`/`RecallFactTool` give an agent a small per-caller key-value fact store that survives across separate sessions, gated by the same `Gate`-based authorization as any other tool.
-- **Browser widget** (`voice-widget.js`, opt-in, zero dependencies) — a small vanilla-JS client for the HTTP API: start a session, record with `MediaRecorder`, upload the turn, play the reply. See "Browser voice agent" in the Cookbook below.
-- **Realtime ephemeral token endpoint (opt-in)** — `POST /voice/realtime/token` mints a short-lived OpenAI Realtime API client token server-side, so your real key never reaches the browser. This is intentionally the full extent of this package's realtime support today — see "Realtime" below for why.
-- **`RealtimeVoiceProvider`/`RealtimeConnection`** — design-stage contracts only, not implemented by anything yet. See "Not implemented yet" below.
+- **Browser widget** (`voice-widget.js`, opt-in, zero dependencies) — a small vanilla-JS client for the HTTP API: start a session, record with `MediaRecorder`, upload the turn, play the reply, live mic/playback level meters, upload progress. See "Browser voice agent" in the Cookbook below.
+- **Realtime voice, browser-direct (`voice-realtime.js`, opt-in, OpenAI only)** — `/voice/realtime/token` mints a short-lived OpenAI Realtime API token server-side; `VoiceRealtimeSession` then opens a live `RTCPeerConnection` directly from the browser to OpenAI (Laravel is never in the audio path) with an `interrupt()` control. Cannot be exercised by this package's test suite — see "Realtime voice" in the Cookbook for the honest testing caveat.
+- **`RealtimeVoiceProvider`/`RealtimeConnection`** — design-stage contracts only, not implemented by anything yet (the browser-direct client above doesn't need them for OpenAI specifically). See "Not implemented yet" below.
 
 With this, every item in the original v0.1 scope is implemented — see [CHANGELOG.md](CHANGELOG.md) for the full build history.
 
@@ -328,31 +328,41 @@ If `php artisan tinker` or `vendor/bin/phpunit` can reach your STT/TTS provider 
 
 </details>
 
-**Realtime (ephemeral token only)**
+**Realtime voice (browser-direct, OpenAI only)**
 
 ```env
 VOICE_REALTIME_ENABLED=true
+VOICE_REALTIME_OPENAI_API_KEY=sk-...   # a real OpenAI key - deliberately separate from
+                                         # VOICE_OPENAI_API_KEY (voice.stt/tts), which may be
+                                         # pointed at a different, OpenAI-compatible provider
 VOICE_REALTIME_OPENAI_VOICE=alloy
 ```
 
-```js
-const response = await fetch('/voice/realtime/token', {
-    method: 'POST',
-    credentials: 'same-origin',
-    headers: {'X-CSRF-TOKEN': csrfToken, 'Content-Type': 'application/json'},
-    body: JSON.stringify({voice: 'alloy'}),
-});
-const {token} = await response.json(); // an "ek_..." token, expires quickly
+```html
+<script src="/vendor/laraveleasyvoice/voice-realtime.js"></script>
+<meta name="csrf-token" content="{{ csrf_token() }}">
+<button id="start">Start realtime call</button>
+<button id="stop">Interrupt</button>
+<script>
+  const session = new VoiceRealtimeSession({
+      onConnected: () => console.log('live'),
+      onEvent: (event) => console.log('event:', event.type, event), // transcripts, turn boundaries, etc. - see OpenAI's Realtime event reference
+      onRemoteLevel: (level) => {}, // 0-1 amplitude of the model's voice, for a live waveform
+      onError: (error) => console.error(error),
+  });
 
-// Hand this token to OpenAI's own official realtime client library/quickstart
-// to open the actual WebRTC connection - this package's job ends here.
+  document.getElementById('start').addEventListener('click', () => session.connect());
+  document.getElementById('stop').addEventListener('click', () => session.interrupt());
+</script>
 ```
 
-This is the one server-side step a browser-direct realtime integration genuinely needs (never expose your real API key to the browser) — not a realtime connection itself. Building the actual duplex audio connection is left to OpenAI's own official client tooling rather than reimplemented here; see "Not implemented yet" for why.
+Publish it with the same `voice-assets` tag as the turn-based widget. `VoiceRealtimeSession` mints a token from `/voice/realtime/token`, then opens a `RTCPeerConnection` **directly from the browser to OpenAI** — Laravel is never in the audio path. `interrupt()` sends OpenAI's `response.cancel` event as an explicit "stop" control; note that OpenAI's own server-side voice-activity detection already auto-interrupts a response when it detects you speaking in the default session config, so `interrupt()` is a backstop, not the only thing making this feel like a real conversation.
+
+**Be honest with yourself about testing this one.** Unlike everything else in this package, `voice-realtime.js` cannot be exercised by `vendor/bin/phpunit` — there is no way to open a real WebRTC connection or use real microphone/speaker hardware from a PHP test process. Every field and endpoint it uses was verified against OpenAI's current API docs before writing it (see the file's own top comment for exactly what), but "verified against docs" is not the same as "tested against a live connection." Test it yourself, in a real browser, against an OpenAI account with Realtime API access enabled (not universal on every account tier) — and expect to hit the occasional event-reliability rough edge the wider developer community has also reported around `response.cancel`/`conversation.item.truncate`, since that's OpenAI's API surface, not something this package can smooth over.
 
 ## Not implemented yet
 
-**A full realtime voice connection.** `Contracts\RealtimeVoiceProvider`/`RealtimeConnection` exist as design-stage contracts only — no class implements either, and both docblocks say so. *How* Laravel should host a long-lived duplex connection at all (Octane+Reverb relaying in-process, an external relay service, or the browser-direct approach the token endpoint above enables) is an infrastructure decision this package won't presume on your behalf. **Barge-in/interruption** needs that same realtime connection to mean anything server-side (there's nothing to cancel mid-generation without one) — the widget's `stopSpeaking()` is a client-side approximation only. **Telephony/SIP** is deliberately untouched — it also carries call-recording-consent obligations that belong to your application, not this package. These are sequenced, not overlooked — each is a larger, harder-to-reverse decision than anything shipped so far. See [CHANGELOG.md](CHANGELOG.md) for the full reasoning.
+**Barge-in reliability guarantees.** The realtime client above genuinely opens a live, interruptible connection — but whether an interruption always lands cleanly depends on OpenAI's own Realtime API behavior, which this package doesn't control. **A PHP-mediated realtime connection** (`Contracts\RealtimeVoiceProvider`/`RealtimeConnection`) remains design-stage only — no class implements either — since the browser-direct approach above makes that unnecessary for the OpenAI case specifically; it would still matter for a provider without a public browser-direct realtime API. **Telephony/SIP** is deliberately untouched — it also carries call-recording-consent obligations that belong to your application, not this package. These are sequenced, not overlooked. See [CHANGELOG.md](CHANGELOG.md) for the full reasoning.
 
 ## Security & Trust
 

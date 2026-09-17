@@ -170,8 +170,17 @@ return [
         'enabled' => env('VOICE_REALTIME_ENABLED', false),
 
         'openai' => [
-            'api_key' => env('VOICE_OPENAI_API_KEY', env('OPENAI_API_KEY')),
-            'url' => env('VOICE_OPENAI_BASE_URL', 'https://api.openai.com/v1'),
+            // Deliberately its OWN key/URL, not shared with voice.stt/tts's
+            // "openai" provider - those are meant to be pointed at any
+            // OpenAI-*compatible* endpoint (Together, a proxy, ...) and
+            // doing that here too would silently send this real OpenAI
+            // account's traffic to a different host. Realtime's WebRTC
+            // signaling is not known to be implemented by any
+            // OpenAI-compatible provider, so this always targets OpenAI's
+            // real API and needs a real OpenAI key even if your STT/TTS
+            // key above belongs to a different provider entirely.
+            'api_key' => env('VOICE_REALTIME_OPENAI_API_KEY', env('OPENAI_API_KEY')),
+            'url' => env('VOICE_REALTIME_OPENAI_BASE_URL', 'https://api.openai.com/v1'),
             'model' => env('VOICE_REALTIME_OPENAI_MODEL', 'gpt-4o-realtime-preview'),
             'voice' => env('VOICE_REALTIME_OPENAI_VOICE', 'alloy'),
             'timeout' => env('VOICE_REALTIME_OPENAI_TIMEOUT', 15),
