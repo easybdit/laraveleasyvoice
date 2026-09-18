@@ -17,7 +17,7 @@
 
 ---
 
-> **v0.1.0 is published on Packagist.** This README documents what's actually implemented today, including work that has landed on `main` since v0.1.0 tagged — see [CHANGELOG.md](CHANGELOG.md) for the phase-by-phase build history and the reasoning behind each design decision. Following v0.1's own cadence, `main` accumulates changes across several phases before the next version tag, rather than tagging every phase.
+> **v0.2.0 is published on Packagist.** This README documents what's actually implemented today. See [CHANGELOG.md](CHANGELOG.md) for the phase-by-phase build history and the reasoning behind each design decision — `main` accumulates changes across several phases before each version tag, rather than tagging every phase.
 
 ## Why LaravelEasyVoice?
 

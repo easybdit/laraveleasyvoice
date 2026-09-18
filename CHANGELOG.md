@@ -1,8 +1,12 @@
 # Changelog
 
-## Unreleased — working toward v0.2
+## Unreleased
 
-Per-phase entries, same convention as v0.1's build-up — logged as work lands on `main`, tagged as a release only once enough has accumulated to justify a version bump (not after every phase). See "v0.1.0" further down for what's already tagged and published.
+Nothing yet — see "v0.2.0" below for the most recently tagged work.
+
+## v0.2.0 — 2026-09-18
+
+Tagged and published to Packagist. Everything from here down through Phase 2 shipped in this release - tenant enforcement, tool tiers, chat mirroring, usage tracking, human handoff, cross-session memory, Deepgram/ElevenLabs providers, the browser widget, realtime voice (OpenAI WebRTC + Deepgram WebSocket, both live-verified end-to-end), a proper `examples/` directory, and two real bugs fixed by live dogfooding. Per-phase entries below, same convention as v0.1's build-up.
 
 ### 🐛 Phase 16: two real bugs found by turn-based dogfooding, both fixed at the source
 
