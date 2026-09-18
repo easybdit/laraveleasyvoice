@@ -98,6 +98,75 @@ class VoiceHttpTest extends TestCase
         $this->get($response->json('audio_url'))->assertOk();
     }
 
+    public function test_the_stt_provider_receives_a_real_audio_extension_not_the_bare_php_tmp_path(): void
+    {
+        // Regression test: UploadedFile::getRealPath() is PHP's raw upload
+        // tmp file (e.g. "phpXXXX.tmp" on this OS, often extensionless on
+        // others) - OpenAiSttProvider names its multipart file after
+        // basename($audioFilePath), so handing it that raw tmp path directly
+        // silently broke STT against at least one real provider ("Unsupported
+        // or corrupted audio format", confirmed live against Together AI's
+        // Whisper endpoint) despite the bytes being a perfectly valid upload.
+        // VoiceTurnController::store() now copies to a path carrying the
+        // real, already-validated extension before calling handleTurn().
+        $this->actingAsFakeUser(7);
+
+        Http::fake([
+            'api.openai.com/v1/audio/transcriptions' => Http::response(['text' => 'Hello there']),
+            'api.openai.com/v1/chat/completions' => Http::response([
+                'model' => 'gpt-4o-mini',
+                'choices' => [['message' => ['content' => 'Hi!']]],
+                'usage' => ['prompt_tokens' => 1, 'completion_tokens' => 1],
+            ]),
+            'api.openai.com/v1/audio/speech' => Http::response('binary-audio', 200, ['Content-Type' => 'audio/mpeg']),
+        ]);
+
+        $sessionId = $this->postJson('/voice/sessions', ['agent' => 'receptionist'])->json('id');
+        $audio = UploadedFile::fake()->create('speech.mp3', 10, 'audio/mpeg');
+
+        $this->post("/voice/sessions/{$sessionId}/turns", ['audio' => $audio])->assertOk();
+
+        Http::assertSent(function ($request) {
+            if (! str_contains($request->url(), 'audio/transcriptions')) {
+                return false;
+            }
+
+            $body = (string) $request->body();
+
+            return str_contains($body, '.mp3"') && ! str_contains($body, '.tmp"');
+        });
+    }
+
+    public function test_an_llm_provider_failure_returns_a_generic_502_without_leaking_the_real_error(): void
+    {
+        // Regression test: AI::provider()->run() throws LaravelEasyAI's OWN
+        // exception types (EasyAI\LaravelAI\Exceptions\*), not this
+        // package's - found live when an unreachable LLM backend during the
+        // LLM step of a turn produced a raw, unwrapped stack trace at the
+        // HTTP layer instead of the same generic 502 STT/TTS failures
+        // already get, since VoiceTurnController's catch clause only
+        // matches EasyAI\LaravelVoice\Exceptions\*. VoiceAgent::handleTurn()
+        // now re-wraps an LLM-step failure into this package's own exception
+        // types before it leaves the method.
+        $this->actingAsFakeUser(7);
+
+        Http::fake([
+            'api.openai.com/v1/audio/transcriptions' => Http::response(['text' => 'Hello there']),
+            'api.openai.com/v1/chat/completions' => Http::response(
+                ['error' => ['message' => 'upstream-secret-detail-should-not-leak']],
+                500
+            ),
+        ]);
+
+        $sessionId = $this->postJson('/voice/sessions', ['agent' => 'receptionist'])->json('id');
+        $audio = UploadedFile::fake()->create('speech.mp3', 10, 'audio/mpeg');
+
+        $response = $this->post("/voice/sessions/{$sessionId}/turns", ['audio' => $audio]);
+
+        $response->assertStatus(502);
+        $this->assertStringNotContainsString('upstream-secret-detail-should-not-leak', $response->getContent());
+    }
+
     public function test_an_oversized_upload_is_rejected_before_any_provider_call(): void
     {
         $this->actingAsFakeUser(7);

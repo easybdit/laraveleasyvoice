@@ -30,8 +30,24 @@ class VoiceTurnController extends Controller
             'audio' => ['required', 'file', 'mimes:mp3,mpga,wav,m4a,webm,ogg,flac', "max:{$maxKb}"],
         ]);
 
+        $uploadedAudio = $request->file('audio');
+
+        // UploadedFile::getRealPath() is PHP's raw upload tmp file - on this
+        // OS that's a bare "phpXXXX.tmp" path, and on others it's often
+        // extensionless entirely. Both STT providers infer the audio
+        // container from this path's extension (the multipart filename for
+        // OpenAI-compatible endpoints, the Content-Type header for
+        // Deepgram) - handing them a ".tmp"/extensionless path silently
+        // breaks that detection ("Unsupported or corrupted audio format")
+        // even though the actual bytes are a perfectly valid upload. Copying
+        // to a path with the real (already `mimes`-validated) extension
+        // fixes this at the source rather than in each provider.
+        $extension = $uploadedAudio->getClientOriginalExtension() ?: $uploadedAudio->extension() ?: 'webm';
+        $audioFilePath = $uploadedAudio->getRealPath().'.'.$extension;
+        copy($uploadedAudio->getRealPath(), $audioFilePath);
+
         try {
-            $turn = Voice::agent($session->agent)->handleTurn($session, $request->file('audio')->getRealPath());
+            $turn = Voice::agent($session->agent)->handleTurn($session, $audioFilePath);
         } catch (VoiceLimitExceededException $e) {
             return response()->json(['error' => $e->getMessage()], 429);
         } catch (ProviderException|ConnectionException $e) {
@@ -42,6 +58,8 @@ class VoiceTurnController extends Controller
             return response()->json(['error' => $e->getMessage()], 422);
         } catch (VoiceException $e) {
             return response()->json(['error' => $e->getMessage()], 409);
+        } finally {
+            @unlink($audioFilePath);
         }
 
         return response()->json([

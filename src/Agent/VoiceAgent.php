@@ -14,6 +14,8 @@ use EasyAI\LaravelVoice\Events\SpeechTranscribed;
 use EasyAI\LaravelVoice\Events\ToolCallCompleted;
 use EasyAI\LaravelVoice\Events\ToolCallStarted;
 use EasyAI\LaravelVoice\Events\VoiceError;
+use EasyAI\LaravelVoice\Exceptions\ConnectionException;
+use EasyAI\LaravelVoice\Exceptions\ProviderException;
 use EasyAI\LaravelVoice\Exceptions\VoiceException;
 use EasyAI\LaravelVoice\Exceptions\VoiceLimitExceededException;
 use EasyAI\LaravelVoice\Models\VoiceSession;
@@ -323,7 +325,21 @@ class VoiceAgent
             $assistantTurn->update(['status' => 'failed', 'error_message' => $e->getMessage()]);
             event(new VoiceError($session, 'llm', $e));
 
-            throw $e;
+            // AI::provider()->run() throws LaravelEasyAI's OWN exception
+            // types (EasyAI\LaravelAI\Exceptions\*), not this package's -
+            // a real gap found live (an unreachable Ollama backend during
+            // the LLM step produced a raw, unwrapped stack trace at the
+            // HTTP layer instead of the generic 502 VoiceTurnController's
+            // catch block gives STT/TTS failures, since that catch only
+            // matches EasyAI\LaravelVoice\Exceptions\*). Re-wrapped here so
+            // every caller of handleTurn() - this HTTP controller or any
+            // other consumer - gets one consistent exception contract
+            // regardless of which downstream step failed.
+            throw match (true) {
+                $e instanceof \EasyAI\LaravelAI\Exceptions\ConnectionException => new ConnectionException($e->getMessage(), $e->getProvider(), $e->getContext(), $e->getCode(), $e),
+                $e instanceof \EasyAI\LaravelAI\Exceptions\ProviderException => new ProviderException($e->getMessage(), $e->getProvider(), $e->getContext(), $e->getCode(), $e),
+                default => $e,
+            };
         }
 
         try {
