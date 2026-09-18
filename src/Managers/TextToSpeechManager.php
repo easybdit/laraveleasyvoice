@@ -2,6 +2,7 @@
 
 namespace EasyAI\LaravelVoice\Managers;
 
+use EasyAI\LaravelVoice\Providers\Tts\DeepgramTtsProvider;
 use EasyAI\LaravelVoice\Providers\Tts\ElevenLabsTtsProvider;
 use EasyAI\LaravelVoice\Providers\Tts\OpenAiTtsProvider;
 use Illuminate\Support\Manager;
@@ -21,5 +22,10 @@ class TextToSpeechManager extends Manager
     protected function createElevenlabsDriver(): ElevenLabsTtsProvider
     {
         return new ElevenLabsTtsProvider($this->config->get('voice.tts.providers.elevenlabs', []));
+    }
+
+    protected function createDeepgramDriver(): DeepgramTtsProvider
+    {
+        return new DeepgramTtsProvider($this->config->get('voice.tts.providers.deepgram', []));
     }
 }

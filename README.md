@@ -87,7 +87,7 @@ Add a path repository to your own (uncommitted) local composer config rather tha
 
 ## What's implemented today
 
-- **`Voice::stt($driver)` / `Voice::tts($driver)`** — provider-agnostic speech contracts (`SpeechToTextProvider`, `TextToSpeechProvider`), with OpenAI, Deepgram (STT), and ElevenLabs (TTS) implementations.
+- **`Voice::stt($driver)` / `Voice::tts($driver)`** — provider-agnostic speech contracts (`SpeechToTextProvider`, `TextToSpeechProvider`), with OpenAI (STT+TTS), Deepgram (STT+TTS), and ElevenLabs (TTS) implementations.
 - **`Voice::registerAgent()` / `Voice::agent()`** — named, reusable voice agents that wire STT → LaravelEasyAI's `AI::provider()->tools()->run()` agent loop → TTS into one call.
 - **Sessions & turns** (`voice_sessions`, `voice_turns`) — persisted history per caller, with token/latency accounting on the session.
 - **Events** — `SessionStarted`, `SessionEnded`, `SpeechTranscribed`, `ToolCallStarted`, `ToolCallCompleted`, `ResponseSynthesized`, `VoiceError`, all fired through Laravel's own `Event` facade.
@@ -273,6 +273,37 @@ $result->raw;                // full decoded Deepgram response, for anything not
 Or wire it into an agent the same way as OpenAI: `$agent->stt('deepgram')->tts('openai')->llm('openai')`.
 
 `DeepgramSttProvider::transcribe()` validates everything it can before making a network call - a missing/unreadable file, an oversized file (`max_file_size`), an empty (0-byte) file, and a missing/blank API key all throw `\InvalidArgumentException` immediately, no request sent. Once the request is made: a non-2xx response, an unparseable (non-JSON) response body, or a response missing the expected `results` field all throw `EasyAI\LaravelVoice\Exceptions\ProviderException`; a timeout, DNS failure, or other connection-level problem throws `EasyAI\LaravelVoice\Exceptions\ConnectionException`. Neither exception ever includes your API key - only Deepgram's own returned status/body. A genuinely empty transcript (Deepgram understood the audio but heard no speech) is *not* an error - it comes back as a normal result with `text === ''`.
+
+**Text-to-speech with Deepgram** — a third TTS provider alongside OpenAI and ElevenLabs, using Deepgram's Aura voices. Shares the same `VOICE_DEEPGRAM_API_KEY` as Deepgram STT above (one Deepgram account, one key) — no separate `VOICE_DEEPGRAM_TTS_API_KEY` exists or is needed:
+
+```env
+VOICE_TTS_PROVIDER=deepgram        # or leave the default (openai) and pass 'deepgram' per call instead
+VOICE_DEEPGRAM_API_KEY=...         # reused from the STT config above - set it once
+# optional overrides - all have working defaults:
+# VOICE_DEEPGRAM_BASE_URL=https://api.deepgram.com/v1   # shared with Deepgram STT
+# VOICE_DEEPGRAM_TTS_MODEL=aura-2-thalia-en
+# VOICE_DEEPGRAM_TTS_FORMAT=mp3
+# VOICE_DEEPGRAM_TTS_TIMEOUT=60
+# VOICE_DEEPGRAM_TTS_MAX_INPUT_LENGTH=2000   # Deepgram's own documented per-request character cap
+```
+
+```php
+use EasyAI\LaravelVoice\Facades\Voice;
+
+$result = Voice::tts('deepgram')->synthesize('Hello there', [
+    'model' => 'aura-2-thalia-en',   // optional - falls back to voice.tts.providers.deepgram.model
+    'format' => 'mp3',               // optional - Deepgram's own "encoding" value (mp3, linear16, mulaw, alaw, flac, aac, opus)
+]);
+
+$result->binary;             // raw audio bytes
+$result->mimeType;           // e.g. audio/mpeg for mp3
+$result->durationSeconds;    // always null - Deepgram's /v1/speak response doesn't include one, so this package doesn't invent it
+$result->raw;                 // always [] - the response body is audio, not JSON, so there's no structured payload to keep
+```
+
+Or wire it into an agent the same way as the others: `$agent->stt('openai')->tts('deepgram')->llm('openai')`.
+
+Unlike OpenAI/ElevenLabs, Deepgram has **no separate "voice" parameter** — the `model` value itself selects the voice (e.g. `aura-2-thalia-en` is the "Thalia" voice), confirmed against Deepgram's own current API reference, so this provider has no `voice` option to set. `DeepgramTtsProvider::synthesize()` validates empty text, `max_input_length` (Deepgram's own documented 2000-character cap — a longer request would otherwise get a 413 from Deepgram itself), and a missing/blank API key before making any network call, all as `\InvalidArgumentException`. Once the request is made: a non-2xx response or an empty audio body both throw `ProviderException`; a timeout, DNS failure, or other connection-level problem throws `ConnectionException`. Neither exception ever includes your API key. This is a buffered implementation only — the full audio is generated and returned in one response, the same way the OpenAI and ElevenLabs providers already work; streaming isn't implemented for any TTS provider yet.
 
 **Memory** — within one session, prior turns are already included as context (`contextTurns()`, default 10) — "My name is Murad" followed by "What's my name?" works today as long as both are in the same call. For the same fact to survive a *separate* call (the caller phoning back next week), opt an agent into the two memory tools:
 
@@ -490,6 +521,12 @@ Tests use `Http::fake()` against the real provider URL patterns (mirroring Larav
 
 ```bash
 DEEPGRAM_API_KEY=your-real-key vendor/bin/phpunit --filter DeepgramSttIntegrationTest
+```
+
+**Optional: live Deepgram TTS integration test.** `tests/Feature/DeepgramTtsIntegrationTest.php` calls the real Deepgram API with a short fixed string to confirm the full text → Deepgram → audio round trip (checks for non-empty binary audio and the expected content type, not exact bytes). Same opt-in gate, same key:
+
+```bash
+DEEPGRAM_API_KEY=your-real-key vendor/bin/phpunit --filter DeepgramTtsIntegrationTest
 ```
 
 Never commit a real key — pass it as an inline env var, as above, or in an uncommitted `.env`/`phpunit.xml.local` used only for local runs.

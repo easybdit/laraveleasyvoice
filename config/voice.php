@@ -89,6 +89,38 @@ return [
                 'retries' => env('VOICE_TTS_RETRIES', 2),
                 'retry_sleep_ms' => env('VOICE_TTS_RETRY_SLEEP_MS', 250),
             ],
+
+            'deepgram' => [
+                // Deliberately the same credential as voice.stt.providers.deepgram
+                // (one Deepgram account, one key) - no separate
+                // VOICE_DEEPGRAM_TTS_API_KEY exists.
+                'api_key' => env('VOICE_DEEPGRAM_API_KEY'),
+                'url' => env('VOICE_DEEPGRAM_BASE_URL', 'https://api.deepgram.com/v1'),
+
+                // Deepgram's TTS "model" value IS the voice (e.g.
+                // aura-2-thalia-en) - there is no separate voice
+                // parameter the way OpenAI/ElevenLabs have one, confirmed
+                // against Deepgram's own current API reference. Same
+                // default voice already used by voice-realtime-deepgram.js's
+                // speak stage, for consistency across the package.
+                'model' => env('VOICE_DEEPGRAM_TTS_MODEL', 'aura-2-thalia-en'),
+
+                // Deepgram's real query parameter is "encoding", not
+                // "format" - named 'format' here only to match this
+                // config array's naming convention with the openai/
+                // elevenlabs blocks above; its value is passed straight
+                // through as Deepgram's own "encoding" value.
+                'format' => env('VOICE_DEEPGRAM_TTS_FORMAT', 'mp3'),
+
+                'timeout' => env('VOICE_DEEPGRAM_TTS_TIMEOUT', 60),
+
+                // Deepgram's own documented per-request character limit
+                // (Aura-1 and Aura-2 both): exceeding it returns a 413.
+                'max_input_length' => env('VOICE_DEEPGRAM_TTS_MAX_INPUT_LENGTH', 2000),
+
+                'retries' => env('VOICE_TTS_RETRIES', 2),
+                'retry_sleep_ms' => env('VOICE_TTS_RETRY_SLEEP_MS', 250),
+            ],
         ],
     ],
 

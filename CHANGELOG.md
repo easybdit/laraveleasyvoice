@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### 🔊 Phase 18: Deepgram TTS, a third text-to-speech provider
+
+`Voice::tts('deepgram')` now works, alongside the existing `openai`/`elevenlabs` drivers. Phase 2's audit found no Deepgram TTS implementation existed at all (only Deepgram's realtime Voice Agent had a `speak` stage, an unrelated browser WebSocket feature) - this phase builds it from scratch as a buffered (non-streaming) `TextToSpeechProvider`, the same shape as the other two.
+
+Wire format confirmed against Deepgram's own current API reference before writing any code, not assumed to match OpenAI/ElevenLabs: `POST /v1/speak` takes the text as a JSON body (`{"text": "..."}`, not a query param or multipart field), `model` and `encoding` as query parameters, `Authorization: Token <key>` (same scheme as Deepgram STT), and returns the raw audio bytes directly in the response body - no JSON envelope, and critically no duration field, so `AudioResult::durationSeconds` stays `null` here rather than being invented (same "don't invent what isn't there" posture Phase 17 established for STT's malformed-response handling). Also confirmed: Deepgram's `model` parameter *is* the voice (e.g. `aura-2-thalia-en` selects "Thalia") - there's no separate voice parameter the way OpenAI/ElevenLabs have one, so `DeepgramTtsProvider` intentionally has no `voice` option; and the documented per-request character cap is 2000 (a 413 past that), used as `max_input_length`'s default.
+
+**Config reuses the existing `VOICE_DEEPGRAM_API_KEY`** - deliberately, per this package's one-Deepgram-account-one-key posture already established for STT. No `VOICE_DEEPGRAM_TTS_API_KEY` exists. `voice.tts.providers.deepgram` adds `model` (default `aura-2-thalia-en`, matching `voice-realtime-deepgram.js`'s own default speak voice for consistency), `format` (Deepgram's `encoding` value, default `mp3`), `timeout`, `max_input_length`, and the shared `retries`/`retry_sleep_ms` TTS vars - `container`/`sample_rate`/`bit_rate`/`speed` are real Deepgram parameters too but weren't wired up, to keep this the smallest compatible increment rather than guessing which of them are actually needed yet.
+
+`InstallCommand` needed no changes - Phase 1's `configureDeepgram()` step already writes the one shared key this provider now also reads; a second prompt would have been a duplicate.
+
+19 new tests in `tests/Feature/DeepgramTtsProviderTest.php` (provider/default-driver resolution, config loading, request shape, model/format overrides, MIME-type mapping, empty text, over-length text, missing/blank key, invalid key, 4xx/5xx, empty audio body, timeout, network failure, no-key-leak) plus a new opt-in `tests/Feature/DeepgramTtsIntegrationTest.php` (skipped without a real key, verifies text → Deepgram → non-empty audio with the expected content type, no exact-bytes assertion). Full suite: 107 tests, 261 assertions, all passing (2 intentionally skipped - the STT and TTS integration tests, absent a real key). No changes to OpenAI, ElevenLabs, Deepgram STT, the `TextToSpeechProvider`/`SpeechToTextProvider` contracts, `VoiceAgent`, realtime, or the browser widget. TTS streaming is not implemented for any provider yet - out of scope for this phase.
+
 ### 🎧 Phase 17: Deepgram STT hardened for production, audited and gap-filled end to end
 
 A focused pass over `DeepgramSttProvider` only (no OpenAI/TTS/realtime/browser/telephony changes) to close the gaps a production-readiness audit found in the existing implementation from Phase 7.
