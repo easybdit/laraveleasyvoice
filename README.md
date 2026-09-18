@@ -178,6 +178,8 @@ Voice::registerAgent('support', function ($agent) {
 });
 ```
 
+If a handler throws (e.g. `firstOrFail()` above on a nonexistent order), the turn doesn't fail — LaravelEasyAI's own `Tool::execute()` catches the exception and hands the model `{"error": "..."}` instead, so the agent can react conversationally ("I couldn't find that order") rather than the whole turn erroring out. Verified end-to-end through both `VoiceAgent::handleTurn()` and the real HTTP turn endpoint, not just assumed.
+
 **RAG voice agent ("What is the admission policy?")** — no new API, just call `AI::rag()` from inside a tool or bake it into the system prompt per turn:
 
 ```php

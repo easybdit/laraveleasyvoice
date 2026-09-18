@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### 🧯 Phase 23: a tool handler exception verified through the real HTTP turn endpoint
+
+Phase 21 closed the HTTP-level gap for a successful tool call and a Gate-denied tool, but left the third case from `VoiceAgentDeepgramToolsTest`'s own three-case matrix - a tool handler that throws - unverified through the actual `POST /voice/sessions/{id}/turns` endpoint. This phase closes it with one new test in `tests/Feature/VoiceHttpToolsTest.php`, test-only, no production code changed.
+
+The test proves a handler throwing `\RuntimeException` (the same exception LaravelEasyAI's own `Tool::execute()` catches and converts to `['error' => $e->getMessage()]` before it ever reaches `VoiceAgent::handleTurn()`) never surfaces as a 5xx or a raw stack trace over HTTP: the handler is confirmed to actually run, the request still returns 200, the model's follow-up response (after seeing the tool's error result) is returned as the turn's `transcript` and persisted, `tool_calls` reflects the attempted call, and the assistant `voice_turns` row persists as `completed` with a null `error_message` - exactly like the existing denial case, not a new error path `VoiceTurnController::store()` needs to catch.
+
+**The test passed against the existing implementation on the first run - no bug found, no production code touched.** Full suite: 120 tests, 367 assertions, all passing (2 intentionally skipped - the Phase 1/2 live-API integration tests, absent a real key).
+
 ### 🎛️ Phase 22: streaming responses and tool-calling verified together
 
 `VoiceAgent::streamResponses()` and `->tools()` are independent, orthogonal setters - nothing in this package or in LaravelEasyAI's `AbstractDriver::run()` prevents both being active on the same agent, and `run()`'s own docblock says every step of the agent loop streams when `$onChunk` is given, not just the final one - but no existing test had ever exercised the combination. This phase closes that gap with one new test in `tests/Feature/VoiceAgentTest.php`, test-only, no production code changed.
