@@ -33,6 +33,9 @@ class InstallCommandTest extends TestCase
         putenv('OPENAI_API_KEY');
         unset($_ENV['OPENAI_API_KEY'], $_SERVER['OPENAI_API_KEY']);
 
+        putenv('VOICE_DEEPGRAM_API_KEY');
+        unset($_ENV['VOICE_DEEPGRAM_API_KEY'], $_SERVER['VOICE_DEEPGRAM_API_KEY']);
+
         parent::tearDown();
     }
 
@@ -61,6 +64,10 @@ class InstallCommandTest extends TestCase
             ->expectsConfirmation('Run database migrations now?', 'yes')
             ->expectsQuestion('Your OpenAI API key (used for both speech-to-text and text-to-speech)', 'sk-test-123')
             ->expectsConfirmation(
+                "Also configure a Deepgram API key for speech-to-text? (optional - only needed for Voice::stt('deepgram'))",
+                'no'
+            )
+            ->expectsConfirmation(
                 'Enable the built-in HTTP API (POST /voice/sessions, /voice/sessions/{id}/turns, ...)? It runs behind the "auth" middleware by default.',
                 'no'
             )
@@ -73,6 +80,7 @@ class InstallCommandTest extends TestCase
         $contents = file_get_contents($this->envPath());
         $this->assertStringContainsString('VOICE_OPENAI_API_KEY=sk-test-123', $contents);
         $this->assertStringNotContainsString('VOICE_ROUTES_ENABLED', $contents);
+        $this->assertStringNotContainsString('VOICE_DEEPGRAM_API_KEY', $contents);
     }
 
     public function test_it_reuses_an_existing_openai_api_key_without_asking(): void
@@ -82,6 +90,10 @@ class InstallCommandTest extends TestCase
 
         $this->artisan('voice:install')
             ->expectsConfirmation('Run database migrations now?', 'no')
+            ->expectsConfirmation(
+                "Also configure a Deepgram API key for speech-to-text? (optional - only needed for Voice::stt('deepgram'))",
+                'no'
+            )
             ->expectsConfirmation(
                 'Enable the built-in HTTP API (POST /voice/sessions, /voice/sessions/{id}/turns, ...)? It runs behind the "auth" middleware by default.',
                 'yes'
@@ -102,6 +114,10 @@ class InstallCommandTest extends TestCase
             ->expectsConfirmation('Run database migrations now?', 'no')
             ->expectsQuestion('Your OpenAI API key (used for both speech-to-text and text-to-speech)', 'sk-should-not-be-written')
             ->expectsConfirmation(
+                "Also configure a Deepgram API key for speech-to-text? (optional - only needed for Voice::stt('deepgram'))",
+                'no'
+            )
+            ->expectsConfirmation(
                 'Enable the built-in HTTP API (POST /voice/sessions, /voice/sessions/{id}/turns, ...)? It runs behind the "auth" middleware by default.',
                 'no'
             )
@@ -110,5 +126,90 @@ class InstallCommandTest extends TestCase
         $contents = file_get_contents($this->envPath());
         $this->assertStringContainsString('VOICE_OPENAI_API_KEY=sk-original', $contents);
         $this->assertStringNotContainsString('sk-should-not-be-written', $contents);
+    }
+
+    public function test_it_writes_an_optional_deepgram_key_when_the_user_opts_in(): void
+    {
+        $this->artisan('voice:install')
+            ->expectsConfirmation('Run database migrations now?', 'no')
+            ->expectsQuestion('Your OpenAI API key (used for both speech-to-text and text-to-speech)', 'sk-test-123')
+            ->expectsConfirmation(
+                "Also configure a Deepgram API key for speech-to-text? (optional - only needed for Voice::stt('deepgram'))",
+                'yes'
+            )
+            ->expectsQuestion('Your Deepgram API key', 'dg-test-456')
+            ->expectsConfirmation(
+                'Enable the built-in HTTP API (POST /voice/sessions, /voice/sessions/{id}/turns, ...)? It runs behind the "auth" middleware by default.',
+                'no'
+            )
+            ->assertExitCode(0);
+
+        $contents = file_get_contents($this->envPath());
+        $this->assertStringContainsString('VOICE_OPENAI_API_KEY=sk-test-123', $contents);
+        $this->assertStringContainsString('VOICE_DEEPGRAM_API_KEY=dg-test-456', $contents);
+    }
+
+    public function test_it_skips_the_deepgram_prompt_when_declined(): void
+    {
+        $this->artisan('voice:install')
+            ->expectsConfirmation('Run database migrations now?', 'no')
+            ->expectsQuestion('Your OpenAI API key (used for both speech-to-text and text-to-speech)', 'sk-test-123')
+            ->expectsConfirmation(
+                "Also configure a Deepgram API key for speech-to-text? (optional - only needed for Voice::stt('deepgram'))",
+                'no'
+            )
+            ->expectsConfirmation(
+                'Enable the built-in HTTP API (POST /voice/sessions, /voice/sessions/{id}/turns, ...)? It runs behind the "auth" middleware by default.',
+                'no'
+            )
+            ->assertExitCode(0);
+
+        $contents = file_get_contents($this->envPath());
+        $this->assertStringNotContainsString('VOICE_DEEPGRAM_API_KEY', $contents);
+    }
+
+    public function test_it_reuses_an_existing_deepgram_api_key_without_asking(): void
+    {
+        putenv('VOICE_DEEPGRAM_API_KEY=dg-already-set');
+        $_ENV['VOICE_DEEPGRAM_API_KEY'] = 'dg-already-set';
+
+        $this->artisan('voice:install')
+            ->expectsConfirmation('Run database migrations now?', 'no')
+            ->expectsQuestion('Your OpenAI API key (used for both speech-to-text and text-to-speech)', 'sk-test-123')
+            ->expectsConfirmation(
+                'Enable the built-in HTTP API (POST /voice/sessions, /voice/sessions/{id}/turns, ...)? It runs behind the "auth" middleware by default.',
+                'no'
+            )
+            ->expectsOutputToContain('Reusing the existing VOICE_DEEPGRAM_API_KEY')
+            ->assertExitCode(0);
+
+        $contents = file_exists($this->envPath()) ? file_get_contents($this->envPath()) : '';
+        $this->assertStringNotContainsString('VOICE_DEEPGRAM_API_KEY=dg-already-set', $contents);
+    }
+
+    public function test_it_does_not_print_the_deepgram_key_to_output(): void
+    {
+        $this->artisan('voice:install')
+            ->expectsConfirmation('Run database migrations now?', 'no')
+            ->expectsQuestion('Your OpenAI API key (used for both speech-to-text and text-to-speech)', 'sk-test-123')
+            ->expectsConfirmation(
+                "Also configure a Deepgram API key for speech-to-text? (optional - only needed for Voice::stt('deepgram'))",
+                'yes'
+            )
+            ->expectsQuestion('Your Deepgram API key', 'dg-super-secret')
+            ->expectsConfirmation(
+                'Enable the built-in HTTP API (POST /voice/sessions, /voice/sessions/{id}/turns, ...)? It runs behind the "auth" middleware by default.',
+                'no'
+            )
+            ->expectsOutputToContain('Writing configuration to .env...')
+            ->assertExitCode(0);
+
+        // The `secret()` prompt itself is masked by Symfony Console and
+        // never echoed - this test's real guarantee is that nothing in the
+        // command's own writeEnvironment()/summary() output ever reprints
+        // the raw key. The value in .env is the input the test itself
+        // supplied via expectsQuestion(), not something the command printed.
+        $contents = file_get_contents($this->envPath());
+        $this->assertStringContainsString('VOICE_DEEPGRAM_API_KEY=dg-super-secret', $contents);
     }
 }

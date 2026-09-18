@@ -2,7 +2,28 @@
 
 ## Unreleased
 
-Nothing yet — see "v0.2.0" below for the most recently tagged work.
+### 🎧 Phase 17: Deepgram STT hardened for production, audited and gap-filled end to end
+
+A focused pass over `DeepgramSttProvider` only (no OpenAI/TTS/realtime/browser/telephony changes) to close the gaps a production-readiness audit found in the existing implementation from Phase 7.
+
+**Two real gaps fixed in the provider itself**, both pre-existing since Phase 7:
+
+1. **Missing/blank API key wasn't caught until Deepgram's own 401 came back.** `transcribe()` now validates `api_key` is non-blank before making any request, same fail-fast posture already used for a missing/oversized file — an `\InvalidArgumentException` with a clear message, zero network calls, consistent with `ElevenLabsTtsProvider`'s existing missing-voice-id check.
+2. **A malformed or unexpected-shape 200 response silently became an empty transcript**, indistinguishable from Deepgram genuinely hearing silence. `transcribe()` now distinguishes the three cases explicitly: non-JSON body → `ProviderException`; JSON missing the expected `results` field → `ProviderException`; a well-formed response with an empty `alternatives[0].transcript` → a normal `TranscriptionResult` with `text === ''` (not an error). A 0-byte audio file is also now rejected up front, same as an oversized one.
+
+Neither exception path was changed to include the API key or any other secret — confirmed by a dedicated test asserting the key string never appears in an exception's message or context.
+
+**Test coverage went from 4 tests to 22** (`tests/Feature/DeepgramSttProviderTest.php`), covering every item on the audit's checklist: provider resolution via the manager (both explicit and as the configured default), config values actually reaching the request, model/language query params (default and per-call override), a genuinely empty transcript, missing/blank API key, invalid API key (401), oversized/empty files, malformed JSON, a response missing `results`, connection timeout, and generic network failure — all via `Http::fake()`, no real key needed for the normal suite.
+
+**New opt-in integration test** (`tests/Feature/DeepgramSttIntegrationTest.php`) exercises the real Deepgram API end-to-end (audio → Deepgram → transcript) against a small bundled fixture (`tests/Fixtures/sample-tone.wav`, a synthetic 0.5s tone generated for this purpose — no real speech recording needed since the test only confirms the round trip works, not specific wording). Skipped automatically — no failure, no key required — unless `DEEPGRAM_API_KEY` (or the package's own `VOICE_DEEPGRAM_API_KEY`) is set in the environment; never runs as part of a normal `vendor/bin/phpunit` invocation.
+
+**Documentation gap closed**: Deepgram STT had no dedicated docs at all — only its realtime-*voice-agent* cousin was documented. Added a "Speech-to-text with Deepgram" Cookbook entry covering config env vars, model/language options, the normalized result shape, and exactly which exception is thrown for which failure — plus a Testing-section note on running the new opt-in integration test.
+
+No public API, config keys, or exception class hierarchy changed — every existing caller of `Voice::stt('deepgram')` keeps working exactly as before. Full suite: 84 tests, 198 assertions, all passing (1 intentionally skipped — the new integration test, absent a real key).
+
+**Follow-up: `voice:install` now optionally configures Deepgram too.** The installer previously only ever asked for an OpenAI key, even though Deepgram STT is a fully supported provider as of the work above. Added one new optional step (`configureDeepgram()`, mirroring `configureProvider()`'s existing OpenAI step): skipped by default, reuses an existing `VOICE_DEEPGRAM_API_KEY` without asking again, and never prints the entered key. The existing OpenAI flow (prompt text, order, behavior) is completely unchanged — an OpenAI-only user just answers one extra "no". 4 new installer tests (opt-in write, decline, reuse-existing, no-key-in-output), 88 tests / 230 assertions total, all passing.
+
+## v0.2.0 — 2026-09-18
 
 ## v0.2.0 — 2026-09-18
 

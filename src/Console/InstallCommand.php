@@ -6,16 +6,16 @@ use Illuminate\Console\Command;
 
 /**
  * `php artisan voice:install` - publishes config/migrations, runs
- * migrations, and configures the OpenAI STT/TTS key. Guided and safe to
- * re-run: never overwrites an existing config file, asset, or a real
- * .env value without asking first - same posture as LaravelEasyAI's own
- * `laravelai:install`.
+ * migrations, and configures the OpenAI STT/TTS key (required) plus an
+ * optional Deepgram STT key. Guided and safe to re-run: never overwrites
+ * an existing config file, asset, or a real .env value without asking
+ * first - same posture as LaravelEasyAI's own `laravelai:install`.
  */
 class InstallCommand extends Command
 {
     protected $signature = 'voice:install {--force : Overwrite existing published files without confirmation}';
 
-    protected $description = 'Interactively set up LaravelEasyVoice - publishes config/migrations, runs migrations, and configures OpenAI STT/TTS';
+    protected $description = 'Interactively set up LaravelEasyVoice - publishes config/migrations, runs migrations, and configures OpenAI STT/TTS (plus an optional Deepgram STT key)';
 
     public function handle(): int
     {
@@ -27,6 +27,7 @@ class InstallCommand extends Command
         $this->maybeMigrate();
 
         $envPairs = $this->configureProvider();
+        $envPairs = array_merge($envPairs, $this->configureDeepgram());
         $envPairs = array_merge($envPairs, $this->configureRoutes());
 
         if (! $this->writeEnvironment($envPairs)) {
@@ -99,6 +100,40 @@ class InstallCommand extends Command
         }
 
         return ['VOICE_OPENAI_API_KEY' => $key];
+    }
+
+    /**
+     * Deepgram is a second, optional STT provider (config/voice.php's
+     * stt.providers.deepgram) - unlike OpenAI it has no bundled TTS/LLM use
+     * in this package and no existing LaravelEasyAI key to fall back to, so
+     * this step is skippable by default rather than asked as if required.
+     * A user who only wants OpenAI just answers "no" and nothing changes.
+     *
+     * @return array<string, string>
+     */
+    private function configureDeepgram(): array
+    {
+        $this->newLine();
+
+        if (env('VOICE_DEEPGRAM_API_KEY')) {
+            $this->info('✓ Reusing the existing VOICE_DEEPGRAM_API_KEY already configured in this app.');
+
+            return [];
+        }
+
+        if (! $this->confirm("Also configure a Deepgram API key for speech-to-text? (optional - only needed for Voice::stt('deepgram'))", false)) {
+            return [];
+        }
+
+        $key = (string) $this->secret('Your Deepgram API key');
+
+        if ($key === '') {
+            $this->warn("No key entered — set VOICE_DEEPGRAM_API_KEY in .env yourself before using Voice::stt('deepgram').");
+
+            return [];
+        }
+
+        return ['VOICE_DEEPGRAM_API_KEY' => $key];
     }
 
     /**

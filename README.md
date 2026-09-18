@@ -63,7 +63,7 @@ composer require easybdit/laraveleasyvoice
 php artisan voice:install
 ```
 
-`voice:install` publishes `config/voice.php`, runs migrations (with your confirmation), configures your OpenAI key (reusing `OPENAI_API_KEY` automatically if LaravelEasyAI already set one — no need to enter it twice), and asks whether to turn on the HTTP API. Prefer to do it by hand instead:
+`voice:install` publishes `config/voice.php`, runs migrations (with your confirmation), configures your OpenAI key (reusing `OPENAI_API_KEY` automatically if LaravelEasyAI already set one — no need to enter it twice), optionally asks for a Deepgram key too (skip it if you only plan to use OpenAI for STT), and asks whether to turn on the HTTP API. Prefer to do it by hand instead:
 
 ```bash
 composer require easybdit/laraveleasyvoice
@@ -242,6 +242,37 @@ Voice::registerAgent('multilingual', function ($agent) {
 ```
 
 Automatic language *detection* (rather than the caller specifying it) isn't built - Whisper can auto-detect if `language` is omitted, but nothing here inspects the transcript to switch the reply language or TTS voice automatically yet.
+
+**Speech-to-text with Deepgram** — a second STT provider alongside OpenAI, useful if you already have a Deepgram account or want its pricing/latency profile instead:
+
+```env
+VOICE_STT_PROVIDER=deepgram        # or leave the default (openai) and pass 'deepgram' per call instead
+VOICE_DEEPGRAM_API_KEY=...
+# optional overrides - all have working defaults:
+# VOICE_DEEPGRAM_BASE_URL=https://api.deepgram.com/v1
+# VOICE_DEEPGRAM_STT_MODEL=nova-2
+# VOICE_DEEPGRAM_STT_TIMEOUT=60
+# VOICE_STT_MAX_FILE_SIZE=26214400   # 25MB, shared with the openai STT provider
+# VOICE_STT_RETRIES=2                # connection-level failures only, never retries a non-2xx response
+# VOICE_STT_RETRY_SLEEP_MS=250
+```
+
+```php
+use EasyAI\LaravelVoice\Facades\Voice;
+
+$result = Voice::stt('deepgram')->transcribe($audioPath, [
+    'model' => 'nova-2',   // optional - falls back to voice.stt.providers.deepgram.model
+    'language' => 'bn',    // optional ISO-639-1 code - omit it to let Deepgram auto-detect where the model supports it
+]);
+
+$result->text;              // transcript string, '' if Deepgram heard no speech
+$result->durationSeconds;   // audio duration Deepgram reported, or null
+$result->raw;                // full decoded Deepgram response, for anything not already normalized
+```
+
+Or wire it into an agent the same way as OpenAI: `$agent->stt('deepgram')->tts('openai')->llm('openai')`.
+
+`DeepgramSttProvider::transcribe()` validates everything it can before making a network call - a missing/unreadable file, an oversized file (`max_file_size`), an empty (0-byte) file, and a missing/blank API key all throw `\InvalidArgumentException` immediately, no request sent. Once the request is made: a non-2xx response, an unparseable (non-JSON) response body, or a response missing the expected `results` field all throw `EasyAI\LaravelVoice\Exceptions\ProviderException`; a timeout, DNS failure, or other connection-level problem throws `EasyAI\LaravelVoice\Exceptions\ConnectionException`. Neither exception ever includes your API key - only Deepgram's own returned status/body. A genuinely empty transcript (Deepgram understood the audio but heard no speech) is *not* an error - it comes back as a normal result with `text === ''`.
 
 **Memory** — within one session, prior turns are already included as context (`contextTurns()`, default 10) — "My name is Murad" followed by "What's my name?" works today as long as both are in the same call. For the same fact to survive a *separate* call (the caller phoning back next week), opt an agent into the two memory tools:
 
@@ -454,6 +485,14 @@ vendor/bin/phpunit
 ```
 
 Tests use `Http::fake()` against the real provider URL patterns (mirroring LaravelEasyAI's own test conventions) — no live API calls are made.
+
+**Optional: live Deepgram STT integration test.** `tests/Feature/DeepgramSttIntegrationTest.php` calls the real Deepgram API with a small bundled audio fixture (`tests/Fixtures/sample-tone.wav`) to confirm the full audio → Deepgram → transcript round trip. It's skipped automatically (no failure, no key required) unless a real key is present:
+
+```bash
+DEEPGRAM_API_KEY=your-real-key vendor/bin/phpunit --filter DeepgramSttIntegrationTest
+```
+
+Never commit a real key — pass it as an inline env var, as above, or in an uncommitted `.env`/`phpunit.xml.local` used only for local runs.
 
 ## License
 

@@ -34,6 +34,14 @@ class DeepgramSttProvider implements SpeechToTextProvider
             throw new \InvalidArgumentException("Audio file exceeds the maximum allowed size of {$maxSize} bytes.");
         }
 
+        if ($size === 0) {
+            throw new \InvalidArgumentException("Audio file is empty: {$audioFilePath}");
+        }
+
+        if (trim((string) ($this->config['api_key'] ?? '')) === '') {
+            throw new \InvalidArgumentException('Deepgram API key is not configured. Set VOICE_DEEPGRAM_API_KEY or voice.stt.providers.deepgram.api_key.');
+        }
+
         $url = rtrim($this->config['url'] ?? 'https://api.deepgram.com/v1', '/').'/listen';
 
         $query = array_filter([
@@ -59,7 +67,26 @@ class DeepgramSttProvider implements SpeechToTextProvider
                 );
             }
 
-            $data = $response->json() ?? [];
+            $data = $response->json();
+
+            if (! is_array($data)) {
+                throw new ProviderException(
+                    'deepgram transcribe error: received a malformed (non-JSON) response',
+                    'deepgram',
+                    ['status' => $response->status()],
+                    $response->status()
+                );
+            }
+
+            if (! array_key_exists('results', $data)) {
+                throw new ProviderException(
+                    'deepgram transcribe error: response is missing the expected "results" field',
+                    'deepgram',
+                    ['status' => $response->status()],
+                    $response->status()
+                );
+            }
+
             $alternative = $data['results']['channels'][0]['alternatives'][0] ?? [];
 
             return new TranscriptionResult(
