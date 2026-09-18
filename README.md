@@ -316,6 +316,25 @@ Voice::registerAgent('deepgram-assistant', function ($agent) {
 
 Providers can also be mixed freely per agent, e.g. `->stt('deepgram')->tts('openai')` — `VoiceAgent` never special-cases which driver is behind either interface.
 
+**Tool-calling on Deepgram + Together** — the tool-calling pattern shown earlier isn't OpenAI-only either; the same `AuthorizedTool` handler, Gate check, and `ToolCallStarted`/`ToolCallCompleted` events work unchanged with a non-OpenAI STT/TTS pair and a non-OpenAI LLM:
+
+```php
+Voice::registerAgent('school-attendance', function ($agent) {
+    $agent->stt('deepgram')->tts('deepgram')->llm('together')->tools([
+        AuthorizedTool::make(
+            name: 'check_attendance',
+            description: "Check today's attendance",
+            parameters: ['type' => 'object', 'properties' => []],
+            ability: 'view-attendance',
+            handler: fn (array $args) => ['present' => 42],
+            tier: AuthorizedTool::TIER_READ,
+        ),
+    ]);
+});
+```
+
+Verified live end-to-end, not just against `Http::fake()`: a real speech WAV transcribed by Deepgram, a genuine tool call made by Together's LLM, the handler executing and its result being fed back, Together's final response being persisted, and Deepgram TTS synthesizing it into real audio — from a separate Laravel R&D app installing this package from its published GitHub commit. `VoiceAgent` doesn't special-case which LLM sits behind `llm()` any more than it special-cases which STT/TTS driver is behind `stt()`/`tts()`.
+
 **Memory** — within one session, prior turns are already included as context (`contextTurns()`, default 10) — "My name is Murad" followed by "What's my name?" works today as long as both are in the same call. For the same fact to survive a *separate* call (the caller phoning back next week), opt an agent into the two memory tools:
 
 ```php
