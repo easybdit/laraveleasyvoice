@@ -57,6 +57,7 @@ class VoiceServiceProvider extends ServiceProvider
             $this->publishes([
                 __DIR__.'/../resources/js/voice-widget.js' => public_path('vendor/laraveleasyvoice/voice-widget.js'),
                 __DIR__.'/../resources/js/voice-realtime.js' => public_path('vendor/laraveleasyvoice/voice-realtime.js'),
+                __DIR__.'/../resources/js/voice-realtime-deepgram.js' => public_path('vendor/laraveleasyvoice/voice-realtime-deepgram.js'),
             ], 'voice-assets');
 
             $this->commands([InstallCommand::class]);

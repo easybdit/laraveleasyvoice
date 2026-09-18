@@ -102,8 +102,8 @@ Add a path repository to your own (uncommitted) local composer config rather tha
 - **Human handoff** — `VoiceAgent::requestHandoff()`/`completeHandoff()` fire `HandoffRequested`/`HandoffCompleted` events for notifying a human agent through whatever channel you already use.
 - **Cross-session memory (opt-in tools)** — `RememberFactTool`/`RecallFactTool` give an agent a small per-caller key-value fact store that survives across separate sessions, gated by the same `Gate`-based authorization as any other tool.
 - **Browser widget** (`voice-widget.js`, opt-in, zero dependencies) — a small vanilla-JS client for the HTTP API: start a session, record with `MediaRecorder`, upload the turn, play the reply, live mic/playback level meters, upload progress. See "Browser voice agent" in the Cookbook below.
-- **Realtime voice, browser-direct, provider-selectable (`voice-realtime.js`, opt-in)** — `voice.realtime.default`/`voice.realtime.providers.<name>`, same pattern as `voice.stt`/`voice.tts`. `/voice/realtime/token` mints a short-lived token server-side, live-verified against both **OpenAI** and **Deepgram** real accounts. `VoiceRealtimeSession` then opens a live connection directly from the browser (Laravel is never in the audio path) with an `interrupt()` control — but the *browser client* currently only speaks OpenAI's protocol (WebRTC + its own event schema); Deepgram's Voice Agent API is a genuinely different transport (raw WebSocket + linear16 PCM audio frames), and no browser client for it exists yet, only the token-minting half. Requesting an unsupported provider fails clearly (422 / a thrown error) rather than silently misconnecting. The OpenAI browser connection cannot be exercised by this package's test suite — see "Realtime voice" in the Cookbook for the honest testing caveat, and its "why a second provider isn't just a config entry" for what one would actually need.
-- **`RealtimeVoiceProvider`/`RealtimeConnection`** — design-stage contracts only, not implemented by anything yet (the browser-direct client above doesn't need them for OpenAI specifically). See "Not implemented yet" below.
+- **Realtime voice, browser-direct, provider-selectable (opt-in)** — `voice.realtime.default`/`voice.realtime.providers.<name>`, same pattern as `voice.stt`/`voice.tts`. `/voice/realtime/token` mints a short-lived token server-side, live-verified against both **OpenAI** and **Deepgram** real accounts. Each provider has its own browser client, since the two protocols are genuinely different transports: `voice-realtime.js` (`VoiceRealtimeSession`) speaks OpenAI's WebRTC + its own event schema; `voice-realtime-deepgram.js` (`VoiceRealtimeDeepgramSession`) speaks Deepgram's raw WebSocket + linear16 PCM protocol, hand-rolled and grounded in Deepgram's own official SDK source rather than prose docs alone. Both open the connection directly from the browser (Laravel is never in the audio path) and expose an `interrupt()` control. Requesting an unsupported provider fails clearly (422) rather than silently misconnecting. Neither browser connection can be exercised by this package's test suite — see "Realtime voice" in the Cookbook for the honest testing caveat, and its "why a second provider isn't just a config entry" for what a *third* provider would actually need.
+- **`RealtimeVoiceProvider`/`RealtimeConnection`** — design-stage contracts only, not implemented by anything yet (the browser-direct clients above don't need them for OpenAI/Deepgram specifically). See "Not implemented yet" below.
 
 With this, every item in the original v0.1 scope is implemented — see [CHANGELOG.md](CHANGELOG.md) for the full build history.
 
@@ -328,7 +328,7 @@ If `php artisan tinker` or `vendor/bin/phpunit` can reach your STT/TTS provider 
 
 </details>
 
-**Realtime voice (browser-direct, OpenAI only)**
+**Realtime voice (browser-direct, OpenAI)**
 
 ```env
 VOICE_REALTIME_ENABLED=true
@@ -358,31 +358,45 @@ VOICE_REALTIME_OPENAI_VOICE=alloy
 
 Publish it with the same `voice-assets` tag as the turn-based widget. `VoiceRealtimeSession` mints a token from `/voice/realtime/token`, then opens a `RTCPeerConnection` **directly from the browser to OpenAI** — Laravel is never in the audio path. `interrupt()` sends OpenAI's `response.cancel` event as an explicit "stop" control; note that OpenAI's own server-side voice-activity detection already auto-interrupts a response when it detects you speaking in the default session config, so `interrupt()` is a backstop, not the only thing making this feel like a real conversation.
 
-**Realtime is provider-selectable, like `voice.stt`/`voice.tts`** — `voice.realtime.default` and `voice.realtime.providers.<name>`, same shape, same reason (so you can choose per your own cost/latency/data-residency needs rather than being locked to one vendor). The token endpoint already accepts a `provider` parameter (`'openai'` or `'deepgram'`, both live-verified) and `VoiceRealtimeSession` a `provider` option. **The browser connection client only speaks `'openai'`'s protocol** — Deepgram's Voice Agent API is a raw WebSocket + PCM-audio transport, genuinely different from OpenAI's WebRTC, and has no browser client built yet (only its token-minting half). Requesting an unsupported provider returns a clear 422 (`/voice/realtime/token`) or throws before connecting (`VoiceRealtimeSession.connect()`), rather than silently misconnecting.
+**Realtime is provider-selectable, like `voice.stt`/`voice.tts`** — `voice.realtime.default` and `voice.realtime.providers.<name>`, same shape, same reason (so you can choose per your own cost/latency/data-residency needs rather than being locked to one vendor). The token endpoint accepts a `provider` parameter (`'openai'` or `'deepgram'`, both live-verified), and each provider has its own browser client class — `VoiceRealtimeSession` (OpenAI, WebRTC) and `VoiceRealtimeDeepgramSession` (Deepgram, WebSocket) — since the two protocols are not close enough to share one class's connection logic. Requesting an unsupported provider from the token endpoint returns a clear 422, rather than silently misconnecting.
 
 <details>
-<summary>Using the Deepgram token endpoint today (token minting only, no browser client yet)</summary>
+<summary>Realtime voice (browser-direct, Deepgram)</summary>
 
 ```env
+VOICE_REALTIME_ENABLED=true
 VOICE_REALTIME_DEEPGRAM_API_KEY=...   # needs Owner/Admin role (or explicit keys:write scope) -
                                         # a default/member key gets a live 403 INSUFFICIENT_PERMISSIONS,
                                         # confirmed against a real account, since minting a scoped
                                         # key is itself a privileged key-management operation
 ```
 
-```js
-const response = await fetch('/voice/realtime/token', {
-    method: 'POST', credentials: 'same-origin',
-    headers: {'X-CSRF-TOKEN': csrfToken, 'Content-Type': 'application/json'},
-    body: JSON.stringify({provider: 'deepgram'}),
-});
-const {token, project_id} = await response.json();
-// A real Deepgram scoped key (scope: usage:write only), project_id auto-resolved
-// from your API key unless voice.realtime.providers.deepgram.project_id is set.
-// Connecting to wss://agent.deepgram.com/ with it is not implemented by this
-// package yet - see DeepgramRealtimeTokenBroker's own docblock for the exact
-// protocol shape if you want to build that client yourself in the meantime.
+```html
+<script src="/vendor/laraveleasyvoice/voice-realtime-deepgram.js"></script>
+<meta name="csrf-token" content="{{ csrf_token() }}">
+<button id="start">Start realtime call</button>
+<button id="stop">Interrupt</button>
+<script>
+  const session = new VoiceRealtimeDeepgramSession({
+      greeting: 'Hello! How can I help you today?',
+      onConnected: () => console.log('live'),
+      onTranscript: (text, role) => console.log(role, text), // 'user' or 'assistant'
+      onEvent: (event) => console.log('event:', event.type, event),
+      onLocalLevel: (level) => {}, // 0-1 mic input amplitude
+      onRemoteLevel: (level) => {}, // 0-1 agent speech amplitude
+      onError: (error) => console.error(error),
+  });
+
+  document.getElementById('start').addEventListener('click', () => session.connect());
+  document.getElementById('stop').addEventListener('click', () => session.interrupt());
+</script>
 ```
+
+Publish it with the same `voice-assets` tag as the other clients. `VoiceRealtimeDeepgramSession` mints a scoped key from `/voice/realtime/token`, then opens a raw WebSocket **directly from the browser to Deepgram** at `wss://agent.deepgram.com/v1/agent/converse` — Laravel is never in the audio path. By default, the agent's "think" (LLM) stage uses Deepgram-managed `open_ai`/`gpt-4o-mini` — Deepgram bills this through your Deepgram account, so **no separate OpenAI key is required** to use this client at all (override via the `think` option if you want a different provider/model, or your own `agent.think.endpoint` for a fully custom LLM). `listen`/`speak` similarly default to Deepgram's own `nova-3` STT and `aura-2-thalia-en` TTS voice, both overridable.
+
+Every protocol detail here (connection URL, browser auth via `Sec-WebSocket-Protocol` subprotocols, the `Settings` message shape, event names) was verified against Deepgram's own official SDK source code, not prose documentation alone — two independent Deepgram doc pages disagreed with each other on both the URL and the event-naming convention before that cross-check. See the top of `voice-realtime-deepgram.js` for the full list of what was confirmed and how.
+
+**Honesty note on `interrupt()`**: unlike OpenAI's `response.cancel`, Deepgram's protocol has no confirmed explicit "stop the current response" message — `interrupt()` here is a best-effort local mute/playback-clear only. Real barge-in relies on Deepgram's own server-side turn detection reacting to continuous mic streaming, which this client always does, including while the agent is talking.
 
 </details>
 
@@ -400,7 +414,7 @@ If/when this gets built, it'll be its own reviewed increment, following the same
 
 </details>
 
-**What's actually been verified live vs. what hasn't.** `OpenAiRealtimeTokenBroker` (the server-side token-minting half) has been tested against a real OpenAI account with real credentials — and that testing genuinely mattered: two documentation-review passes both missed request-body fields that a real API call rejected outright (`session.type` was required and missing; `session.voice` doesn't exist, it's nested under `session.audio.output.voice`). Both are fixed now and a real token has been minted successfully. What has **not** been verified live end-to-end is a completed WebRTC audio connection — because that cannot be exercised by `vendor/bin/phpunit` at all; there is no way to open a real WebRTC connection or use real microphone/speaker hardware from a PHP test process. Test that part yourself, in a real browser, against an OpenAI account with Realtime API access enabled (not universal on every account tier) — and expect to hit the occasional event-reliability rough edge the wider developer community has also reported around `response.cancel`/`conversation.item.truncate`, since that's OpenAI's API surface, not something this package can smooth over.
+**What's actually been verified live vs. what hasn't.** `OpenAiRealtimeTokenBroker` and `DeepgramRealtimeTokenBroker` (the server-side token-minting halves) have both been tested against real accounts with real credentials — and that testing genuinely mattered: two documentation-review passes on OpenAI's request body both missed fields a real API call rejected outright (`session.type` was required and missing; `session.voice` doesn't exist, it's nested under `session.audio.output.voice`), and Deepgram's `scopes` field turned out to be required despite being documented as optional. All fixed and re-verified live. What has **not** been verified live end-to-end for either provider is a completed browser audio connection (WebRTC for OpenAI, WebSocket+PCM for Deepgram) — because neither can be exercised by `vendor/bin/phpunit` at all; there is no way to open a real WebRTC/WebSocket connection or use real microphone/speaker hardware from a PHP test process. Test that part yourself, in a real browser: OpenAI needs Realtime API access enabled on the account (not universal on every tier, and separately gated by having billing/credits configured — see the 429 troubleshooting note below); Deepgram needs a key with Owner/Admin role for the token-minting step (see above). Expect the occasional event-reliability rough edge on OpenAI's side specifically (`response.cancel`/`conversation.item.truncate` community reports) — that's OpenAI's API surface, not something this package can smooth over.
 
 <details>
 <summary>Troubleshooting: connect() fails with "HTTP 429" even though the token mints successfully</summary>
@@ -411,7 +425,7 @@ Token minting (`POST /v1/realtime/client_secrets`) and the actual WebRTC connect
 
 ## Not implemented yet
 
-**Barge-in reliability guarantees.** The realtime client above genuinely opens a live, interruptible connection — but whether an interruption always lands cleanly depends on OpenAI's own Realtime API behavior, which this package doesn't control. **A PHP-mediated realtime connection** (`Contracts\RealtimeVoiceProvider`/`RealtimeConnection`) remains design-stage only — no class implements either — since the browser-direct approach above makes that unnecessary for the OpenAI case specifically; it would still matter for a provider without a public browser-direct realtime API. **Telephony/SIP** is deliberately untouched — it also carries call-recording-consent obligations that belong to your application, not this package. These are sequenced, not overlooked. See [CHANGELOG.md](CHANGELOG.md) for the full reasoning.
+**Barge-in reliability guarantees.** Both realtime clients above genuinely open a live, interruptible connection — but whether an interruption always lands cleanly depends on each provider's own server-side behavior, which this package doesn't control; Deepgram's client in particular has no confirmed explicit "cancel" message the way OpenAI's `response.cancel` is (see that client's own docblock). **A PHP-mediated realtime connection** (`Contracts\RealtimeVoiceProvider`/`RealtimeConnection`) remains design-stage only — no class implements either — since the browser-direct approach above makes that unnecessary for OpenAI/Deepgram specifically; it would still matter for a provider without a public browser-direct realtime API. **Telephony/SIP** is deliberately untouched — it also carries call-recording-consent obligations that belong to your application, not this package. These are sequenced, not overlooked. See [CHANGELOG.md](CHANGELOG.md) for the full reasoning.
 
 ## Security & Trust
 
