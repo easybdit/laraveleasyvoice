@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### 📊 Phase 24: LLM usage/cost accounting fixed for multi-step tool-calling turns
+
+Confirmed by a source-level audit (Phase 8's own discovery): `VoiceAgent::handleTurn()` previously read `getPromptTokens()`/`getCompletionTokens()`/`getEstimatedCost()` only off the single `AIResponse` LaravelEasyAI's `run()` returns - the *last* step of its agent loop. A tool-calling turn makes two or more real LLM calls (the tool-call decision, then the final answer), so every step before the last silently never counted toward `voice_sessions.total_prompt_tokens`/`total_completion_tokens`/`estimated_cost` - a real correctness gap in a feature this package's own README pitches for "a future billing layer."
+
+No fix was possible inside this package alone: LaravelEasyAI's `run()` had no way to expose an intermediate step's own `AIResponse` to a caller. Fixed upstream in `easybdit/laraveleasyai` v2.21.0 (see LaravelEasyAI's own CHANGELOG), which adds a new optional `$onStep(AIResponse $response)` callback to `AIProviderInterface::run()`, fired once per real LLM call - **this package does not define or implement that callback, it only consumes it.**
+
+`VoiceAgent::handleTurn()` now passes an `$onStep` closure as `run()`'s 5th argument, accumulating each step's usage locally and using that sum - not the final response's own usage - for `total_prompt_tokens`/`total_completion_tokens`/`estimated_cost`. Cost accumulation preserves the existing null-safe contract exactly: a step's `getEstimatedCost()` is only added when non-null, and if no step in the turn has a configured price, `estimated_cost` stays `null` rather than becoming a fabricated `0` - nothing invented. For an ordinary single-step turn, `$onStep` fires exactly once and the totals are numerically identical to before - no behavior change for the common case.
+
+**Requires `easybdit/laraveleasyai` ^2.21** (bumped from `^2.14`) - this fix has no effect, and usage tracking would regress to recording nothing at all, on any older installed version, since `$onStep` wouldn't exist for `run()` to call.
+
+The existing regression test (`VoiceAgentTest::test_it_accumulates_llm_usage_across_every_tool_calling_step_not_just_the_final_one`, added earlier in Phase 8 specifically to prove this gap) now passes: 150 prompt tokens and 30 completion tokens correctly summed across both of a two-step tool-calling turn's real LLM calls, with cost correctly summed too. Full suite: 121 tests, 370 assertions, all passing (2 intentionally skipped - the Phase 1/2 live-API integration tests, absent a real key).
+
 ### 🧯 Phase 23: a tool handler exception verified through the real HTTP turn endpoint
 
 Phase 21 closed the HTTP-level gap for a successful tool call and a Gate-denied tool, but left the third case from `VoiceAgentDeepgramToolsTest`'s own three-case matrix - a tool handler that throws - unverified through the actual `POST /voice/sessions/{id}/turns` endpoint. This phase closes it with one new test in `tests/Feature/VoiceHttpToolsTest.php`, test-only, no production code changed.

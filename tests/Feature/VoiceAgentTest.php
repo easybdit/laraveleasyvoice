@@ -363,6 +363,85 @@ class VoiceAgentTest extends TestCase
         $this->assertEqualsWithDelta(0.04, $session->estimated_cost, 0.0001);
     }
 
+    /**
+     * AbstractDriver::run() (vendor/easybdit/laraveleasyai/src/Drivers/
+     * AbstractDriver.php) reassigns $response on every loop iteration and
+     * only returns the LAST step's AIResponse - a tool-calling turn makes
+     * two real LLM calls (the tool-call decision, then the final answer
+     * after the tool result is fed back), each with its own real usage.
+     * handleTurn() reads getPromptTokens()/getCompletionTokens()/
+     * getEstimatedCost() only off that single final $response - this test
+     * checks whether the session's running totals reflect BOTH calls'
+     * usage or only the last one's.
+     */
+    public function test_it_accumulates_llm_usage_across_every_tool_calling_step_not_just_the_final_one(): void
+    {
+        config(['ai.pricing.openai.gpt-4o-mini' => ['input' => 0.01, 'output' => 0.03]]);
+        Gate::define('view-attendance', fn ($user = null) => true);
+
+        Voice::registerAgent('usage-tools-bot', function ($agent) {
+            $agent->stt('openai')->tts('openai')->llm('openai')->tools([
+                AuthorizedTool::make(
+                    name: 'check_attendance',
+                    description: "Check today's attendance",
+                    parameters: ['type' => 'object', 'properties' => []],
+                    ability: 'view-attendance',
+                    handler: fn (array $args) => ['present' => 42],
+                    tier: AuthorizedTool::TIER_READ,
+                ),
+            ]);
+        });
+
+        Http::fake([
+            'api.openai.com/v1/audio/transcriptions' => Http::response(['text' => 'How many students are here today?']),
+            'api.openai.com/v1/audio/speech' => Http::response('binary-audio-bytes', 200, ['Content-Type' => 'audio/mpeg']),
+            'api.openai.com/v1/chat/completions' => Http::sequence()
+                // Step 1: the tool-call decision - its own real usage,
+                // distinct from step 2's, spent deciding to call the tool.
+                ->push([
+                    'model' => 'gpt-4o-mini',
+                    'choices' => [['message' => [
+                        'content' => null,
+                        'tool_calls' => [[
+                            'id' => 'call_1',
+                            'function' => ['name' => 'check_attendance', 'arguments' => '{}'],
+                        ]],
+                    ]]],
+                    'usage' => ['prompt_tokens' => 100, 'completion_tokens' => 20],
+                ])
+                // Step 2: the final answer, after the tool result is fed
+                // back - its own distinct usage.
+                ->push([
+                    'model' => 'gpt-4o-mini',
+                    'choices' => [['message' => ['content' => '42 students are present today.']]],
+                    'usage' => ['prompt_tokens' => 50, 'completion_tokens' => 10],
+                ]),
+        ]);
+
+        $agent = Voice::agent('usage-tools-bot');
+        $session = $agent->startSession(['user_id' => 1]);
+        $audioPath = $this->makeTempAudioFile();
+
+        try {
+            $agent->handleTurn($session, $audioPath);
+        } finally {
+            unlink($audioPath);
+        }
+
+        $session->refresh();
+
+        // Two real LLM calls were made for this one turn - the session's
+        // running totals should reflect BOTH, not just whichever one
+        // AbstractDriver::run() happens to return.
+        $this->assertSame(150, $session->total_prompt_tokens, 'Expected prompt tokens summed across both agent-loop steps (100 + 50).');
+        $this->assertSame(30, $session->total_completion_tokens, 'Expected completion tokens summed across both agent-loop steps (20 + 10).');
+
+        // Step 1: 100 prompt @ $0.01/1k + 20 completion @ $0.03/1k = 0.0016
+        // Step 2: 50 prompt @ $0.01/1k + 10 completion @ $0.03/1k = 0.0008
+        // Expected total: 0.0024
+        $this->assertEqualsWithDelta(0.0024, $session->estimated_cost, 0.0001, 'Expected cost summed across both agent-loop steps.');
+    }
+
     public function test_it_mirrors_turns_into_a_linked_chat_session(): void
     {
         $chatSession = \EasyAI\LaravelAI\Chat\Models\ChatSession::create(['title' => 'Linked chat']);

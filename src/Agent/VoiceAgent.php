@@ -272,6 +272,33 @@ class VoiceAgent
                 }
                 : null;
 
+            // A tool-calling turn makes more than one real LLM call, each
+            // with its own usage - run() only ever returns the LAST step's
+            // response, so reading getPromptTokens()/getCompletionTokens()/
+            // getEstimatedCost() off it alone silently drops every earlier
+            // step's usage. $onStep (added alongside $onToolCall/$onChunk)
+            // fires once per step with that step's real AIResponse, so
+            // every step's usage/cost is accumulated here instead - for an
+            // ordinary single-step turn this fires exactly once and these
+            // totals are identical to reading them off the final response
+            // directly, same as before.
+            $stepPromptTokens = 0;
+            $stepCompletionTokens = 0;
+            $stepCost = null;
+
+            $onStep = function ($stepResponse) use (&$stepPromptTokens, &$stepCompletionTokens, &$stepCost) {
+                $stepPromptTokens += $stepResponse->getPromptTokens();
+                $stepCompletionTokens += $stepResponse->getCompletionTokens();
+
+                // getEstimatedCost() is null unless a rate is configured for
+                // that step's exact provider/model - never invented here.
+                // Mirrors accumulateCost()'s own null-safe accumulation: if
+                // no step ever has a configured rate, $stepCost stays null.
+                if (($cost = $stepResponse->getEstimatedCost()) !== null) {
+                    $stepCost = ($stepCost ?? 0) + $cost;
+                }
+            };
+
             // Exposes the active session to a tool's handler for the exact
             // duration of this call - Tool::execute() only ever receives
             // the LLM's parsed arguments, with no way to pass session
@@ -302,7 +329,7 @@ class VoiceAgent
                     event(new ToolCallCompleted($session, $call->name, $result, $tier));
 
                     $toolCallLog[] = ['name' => $call->name, 'arguments' => $call->arguments, 'tier' => $tier];
-                }, $onChunk);
+                }, $onChunk, $onStep);
             } finally {
                 CurrentVoiceSession::clear();
             }
@@ -316,9 +343,9 @@ class VoiceAgent
                 'status' => 'completed',
             ]);
 
-            $session->increment('total_prompt_tokens', $response->getPromptTokens());
-            $session->increment('total_completion_tokens', $response->getCompletionTokens());
-            $this->accumulateCost($session, $response->getEstimatedCost());
+            $session->increment('total_prompt_tokens', $stepPromptTokens);
+            $session->increment('total_completion_tokens', $stepCompletionTokens);
+            $this->accumulateCost($session, $stepCost);
 
             $this->mirrorIntoChatHistory($session, $userTurn, $assistantTurn);
         } catch (\Throwable $e) {

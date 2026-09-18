@@ -54,7 +54,7 @@ $assistantTurn = $agent->handleTurn($session, $uploadedAudioPath);
 
 - PHP ^8.1
 - Laravel 9–13 (`illuminate/support`, `illuminate/http`)
-- [`easybdit/laraveleasyai`](https://github.com/easybdit/laraveleasyai) — required, not optional. This package has no LLM logic of its own.
+- [`easybdit/laraveleasyai`](https://github.com/easybdit/laraveleasyai) `^2.21` — required, not optional. This package has no LLM logic of its own. `^2.21` specifically (not just any `^2.x`) is needed for accurate token/cost accounting on multi-step tool-calling turns — see the `Analytics\VoiceUsage` note below.
 
 ## Installation
 
@@ -98,7 +98,7 @@ Add a path repository to your own (uncommitted) local composer config rather tha
 - **Multi-tenancy wiring** — `voice.routes.tenant_resolver` resolves the caller's tenant per request; every session-scoped HTTP route enforces it via `VoiceSession::isOwnedBy()`.
 - **Tool tiers** — `AuthorizedTool::make(..., tier: 'destructive')` (`read`/`write`/`destructive`/`privileged`) surfaces on `ToolCallStarted`/`ToolCallCompleted` for auditing, alongside the `Gate` check that actually authorizes the call.
 - **Chat-history mirroring (opt-in)** — link a session to an existing `ai_chat_sessions` row (`chat_session_id`) and every turn is also written to `ai_chat_messages`, so a voice call and a text chat can share one transcript.
-- **`Analytics\VoiceUsage`** — a query service over `voice_sessions`/`voice_turns` for aggregate or per-session usage (STT/TTS duration, tokens, estimated cost, latency), for building your own admin view or a future billing layer.
+- **`Analytics\VoiceUsage`** — a query service over `voice_sessions`/`voice_turns` for aggregate or per-session usage (STT/TTS duration, tokens, estimated cost, latency), for building your own admin view or a future billing layer. Token/cost totals are summed across *every* real LLM call a turn makes, including the intermediate step(s) of a tool-calling turn, not just the final answer — this relies on `easybdit/laraveleasyai` v2.21.0's own per-step `$onStep` callback on `AIProviderInterface::run()` (this package consumes that callback; it isn't this package's own API). `estimated_cost` stays `null`, never a fabricated `0`, whenever no step in a turn has a configured `ai.pricing` rate.
 - **Human handoff** — `VoiceAgent::requestHandoff()`/`completeHandoff()` fire `HandoffRequested`/`HandoffCompleted` events for notifying a human agent through whatever channel you already use.
 - **Cross-session memory (opt-in tools)** — `RememberFactTool`/`RecallFactTool` give an agent a small per-caller key-value fact store that survives across separate sessions, gated by the same `Gate`-based authorization as any other tool.
 - **Browser widget** (`voice-widget.js`, opt-in, zero dependencies) — a small vanilla-JS client for the HTTP API: start a session, record with `MediaRecorder`, upload the turn, play the reply, live mic/playback level meters, upload progress. See "Browser voice agent" in the Cookbook below.
