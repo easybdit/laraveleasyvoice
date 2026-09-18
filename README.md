@@ -305,6 +305,17 @@ Or wire it into an agent the same way as the others: `$agent->stt('openai')->tts
 
 Unlike OpenAI/ElevenLabs, Deepgram has **no separate "voice" parameter** — the `model` value itself selects the voice (e.g. `aura-2-thalia-en` is the "Thalia" voice), confirmed against Deepgram's own current API reference, so this provider has no `voice` option to set. `DeepgramTtsProvider::synthesize()` validates empty text, `max_input_length` (Deepgram's own documented 2000-character cap — a longer request would otherwise get a 413 from Deepgram itself), and a missing/blank API key before making any network call, all as `\InvalidArgumentException`. Once the request is made: a non-2xx response or an empty audio body both throw `ProviderException`; a timeout, DNS failure, or other connection-level problem throws `ConnectionException`. Neither exception ever includes your API key. This is a buffered implementation only — the full audio is generated and returned in one response, the same way the OpenAI and ElevenLabs providers already work; streaming isn't implemented for any TTS provider yet.
 
+**A full voice agent on Deepgram end-to-end** — `VoiceAgent::handleTurn()` (audio → STT → LaravelEasyAI → TTS → stored `AudioResult`) is provider-agnostic by construction, so pointing both ends at Deepgram is just driver selection, no different from any other combination:
+
+```php
+Voice::registerAgent('deepgram-assistant', function ($agent) {
+    $agent->stt('deepgram')->tts('deepgram')->llm('openai')
+        ->systemPrompt('You are a helpful voice assistant. Keep replies short - they will be spoken aloud.');
+});
+```
+
+Providers can also be mixed freely per agent, e.g. `->stt('deepgram')->tts('openai')` — `VoiceAgent` never special-cases which driver is behind either interface.
+
 **Memory** — within one session, prior turns are already included as context (`contextTurns()`, default 10) — "My name is Murad" followed by "What's my name?" works today as long as both are in the same call. For the same fact to survive a *separate* call (the caller phoning back next week), opt an agent into the two memory tools:
 
 ```php

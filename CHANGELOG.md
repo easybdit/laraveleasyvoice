@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### 🔗 Phase 19: the existing VoiceAgent pipeline verified end-to-end with Deepgram
+
+An audit of `VoiceAgent::handleTurn()` (audio → STT → LaravelEasyAI → TTS → stored `AudioResult`, built in Phase 7) found the architecture was already exactly what a provider-agnostic pipeline needs — `$sttDriver`/`$ttsDriver` are plain strings resolved through the existing `SpeechToTextManager`/`TextToSpeechManager`, with nothing OpenAI- or Deepgram-specific anywhere in `VoiceAgent` itself. `->stt('deepgram')->tts('deepgram')` already worked; it just wasn't covered by a test, so it was an unverified claim rather than a proven one.
+
+This phase is test-only: `tests/Feature/VoiceAgentDeepgramTest.php` (6 new tests) exercises the full pipeline through Deepgram on both ends - happy path (transcript persisted, LaravelEasyAI receives it, Deepgram TTS receives the AI's exact reply text, audio stored with its MIME type preserved through to the file extension), Deepgram STT failure (user turn failed, `VoiceError` fired, AI/TTS never called), an LLM failure after a successful Deepgram STT (assistant turn failed, LaravelEasyAI's own exception re-wrapped into this package's type per the existing Phase 16 behavior, TTS never called), a Deepgram TTS failure after a successful AI response (the AI's text stays persisted, exactly as documented), conversation history across two Deepgram-STT turns reaching the second LaravelEasyAI call correctly, and one mixed-provider turn (`stt('deepgram')` + `tts('openai')`) proving the architecture is genuinely provider-agnostic rather than just switchable-but-untested.
+
+**All 6 tests passed against the existing implementation on the first run - zero production source files were touched.** No bug was found, so per this phase's own test-first rule, none was "fixed." Full suite: 113 tests, 304 assertions, all passing (2 intentionally skipped - the Phase 1/2 live-API integration tests, absent a real key).
+
+**Follow-up: real, live end-to-end verification, not just mocked.** Beyond the `Http::fake()` suite above, the same pipeline was run for real - a genuine speech WAV through `VoiceAgent::handleTurn()` with `stt('deepgram')`, `llm('together')`, and `tts('deepgram')` - from a separate Laravel 13 R&D application installing this package from its published GitHub commit (`305cad4b39e121907cee9f91c48dbfab7c248e50`), not the local path/symlink source. Deepgram STT returned the correct real transcript; Together AI returned a non-empty response; Deepgram TTS returned genuine MP3 audio, independently confirmed with the `file` utility (not just this package's own MIME handling); both the user and assistant turns persisted successfully and the session remained active throughout. No production package source was changed during this verification.
+
 ### 🔊 Phase 18: Deepgram TTS, a third text-to-speech provider
 
 `Voice::tts('deepgram')` now works, alongside the existing `openai`/`elevenlabs` drivers. Phase 2's audit found no Deepgram TTS implementation existed at all (only Deepgram's realtime Voice Agent had a `speak` stage, an unrelated browser WebSocket feature) - this phase builds it from scratch as a buffered (non-streaming) `TextToSpeechProvider`, the same shape as the other two.
