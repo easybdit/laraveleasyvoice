@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## v0.3.0 — 2026-09-18
+
+Tagged and published to Packagist. Everything from here down through Phase 17 shipped in this release - Deepgram STT hardened for production (missing-key and malformed-response gaps closed, 22 tests), a third text-to-speech provider (Deepgram TTS), the existing VoiceAgent pipeline verified end-to-end and through the real HTTP endpoint with Deepgram and Together AI (including tool-calling, streaming, and streaming+tool-calling together), a tool-handler exception verified through the real HTTP turn endpoint, LLM usage/cost accounting fixed for multi-step tool-calling turns, concurrent-turn data integrity (sequence locking, atomic cost accounting), `Idempotency-Key` retry support with concurrency-safe `maxTurns` enforcement, and stale pending turn recovery with execution-ownership fencing so a crashed process's stuck turn can be safely resumed instead of `409`ing forever. Per-phase entries below, same convention as v0.1/v0.2's build-up.
+
 ### 🩹 Phase 27: stale pending turn recovery
 
 Phase 26 gave a duplicate `Idempotency-Key` retry three outcomes - `completed` (replay), `failed` (replay), and `pending` (`409`, deliberately not re-attempted). That last case was intentionally left unresolved: a turn stuck at `pending` forever because its owning process died mid-flight (a crash, a killed worker, a server restart) had no way to recover - a retry under the same key would `409` indefinitely, and a retry under a *new* key would silently orphan the original row while re-running (and re-billing) the whole turn from scratch.
