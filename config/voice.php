@@ -119,11 +119,24 @@ return [
     | unless you deliberately want guest access (and 'allow_guest' below
     | is also true).
     |
+    | 'auth' is computed from VOICE_ROUTES_REQUIRE_AUTH (default true)
+    | rather than hardcoded in the array below, specifically so toggling
+    | it for local testing is a one-line .env change that survives
+    | `vendor:publish --force` - hand-editing this array to drop 'auth'
+    | for a quick local test, then losing that edit the next time this
+    | file gets republished, is exactly the mistake this was added to
+    | prevent. For anything beyond that simple on/off - a different guard
+    | entirely, e.g. 'auth:sanctum' - edit the array directly; this env
+    | var only ever adds or omits the literal string 'auth'.
+    |
     */
     'routes' => [
         'enabled' => env('VOICE_ROUTES_ENABLED', false),
         'prefix' => env('VOICE_ROUTES_PREFIX', 'voice'),
-        'middleware' => ['web', 'auth'],
+        'middleware' => array_values(array_filter([
+            'web',
+            env('VOICE_ROUTES_REQUIRE_AUTH', true) ? 'auth' : null,
+        ])),
 
         // Only takes effect if 'auth' is removed from 'middleware' above.
         'allow_guest' => env('VOICE_ROUTES_ALLOW_GUEST', false),
@@ -198,6 +211,31 @@ return [
                 'model' => env('VOICE_REALTIME_OPENAI_MODEL', 'gpt-realtime'),
                 'voice' => env('VOICE_REALTIME_OPENAI_VOICE', 'alloy'),
                 'timeout' => env('VOICE_REALTIME_OPENAI_TIMEOUT', 15),
+            ],
+
+            // Token-minting only, same as 'openai' above - the actual
+            // realtime connection is a raw WebSocket + linear16 PCM audio
+            // protocol, genuinely different from OpenAI's WebRTC + SDP
+            // handshake, and is not implemented by any client in this
+            // package yet (see Realtime\DeepgramRealtimeTokenBroker's
+            // docblock). Only the server-side scoped-key minting exists so
+            // far.
+            'deepgram' => [
+                'api_key' => env('VOICE_REALTIME_DEEPGRAM_API_KEY', env('VOICE_DEEPGRAM_API_KEY')),
+                'url' => env('VOICE_REALTIME_DEEPGRAM_BASE_URL', 'https://api.deepgram.com/v1'),
+
+                // Deepgram's scoped-key endpoint is per-project
+                // (POST /v1/projects/{project_id}/keys). Left null by
+                // default - the broker resolves it automatically via
+                // GET /v1/projects using the API key, so most accounts
+                // (one project) never need to set this. Only required if
+                // your account has more than one project.
+                'project_id' => env('VOICE_REALTIME_DEEPGRAM_PROJECT_ID'),
+
+                // Deepgram's own documented maximum for a scoped key.
+                'ttl_seconds' => env('VOICE_REALTIME_DEEPGRAM_TTL', 3600),
+
+                'timeout' => env('VOICE_REALTIME_DEEPGRAM_TIMEOUT', 15),
             ],
         ],
     ],

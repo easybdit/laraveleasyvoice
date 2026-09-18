@@ -102,7 +102,7 @@ Add a path repository to your own (uncommitted) local composer config rather tha
 - **Human handoff** — `VoiceAgent::requestHandoff()`/`completeHandoff()` fire `HandoffRequested`/`HandoffCompleted` events for notifying a human agent through whatever channel you already use.
 - **Cross-session memory (opt-in tools)** — `RememberFactTool`/`RecallFactTool` give an agent a small per-caller key-value fact store that survives across separate sessions, gated by the same `Gate`-based authorization as any other tool.
 - **Browser widget** (`voice-widget.js`, opt-in, zero dependencies) — a small vanilla-JS client for the HTTP API: start a session, record with `MediaRecorder`, upload the turn, play the reply, live mic/playback level meters, upload progress. See "Browser voice agent" in the Cookbook below.
-- **Realtime voice, browser-direct, provider-selectable (`voice-realtime.js`, opt-in)** — `voice.realtime.default`/`voice.realtime.providers.<name>`, same pattern as `voice.stt`/`voice.tts`. `/voice/realtime/token` mints a short-lived token server-side; `VoiceRealtimeSession` then opens a live connection directly from the browser (Laravel is never in the audio path) with an `interrupt()` control. **Only `'openai'` is implemented** (WebRTC + OpenAI's own event schema) — requesting another provider fails clearly (422 / a thrown error) rather than silently misconnecting. Cannot be exercised by this package's test suite — see "Realtime voice" in the Cookbook for the honest testing caveat, and its "why a second provider isn't just a config entry" for what one would actually need.
+- **Realtime voice, browser-direct, provider-selectable (`voice-realtime.js`, opt-in)** — `voice.realtime.default`/`voice.realtime.providers.<name>`, same pattern as `voice.stt`/`voice.tts`. `/voice/realtime/token` mints a short-lived token server-side, live-verified against both **OpenAI** and **Deepgram** real accounts. `VoiceRealtimeSession` then opens a live connection directly from the browser (Laravel is never in the audio path) with an `interrupt()` control — but the *browser client* currently only speaks OpenAI's protocol (WebRTC + its own event schema); Deepgram's Voice Agent API is a genuinely different transport (raw WebSocket + linear16 PCM audio frames), and no browser client for it exists yet, only the token-minting half. Requesting an unsupported provider fails clearly (422 / a thrown error) rather than silently misconnecting. The OpenAI browser connection cannot be exercised by this package's test suite — see "Realtime voice" in the Cookbook for the honest testing caveat, and its "why a second provider isn't just a config entry" for what one would actually need.
 - **`RealtimeVoiceProvider`/`RealtimeConnection`** — design-stage contracts only, not implemented by anything yet (the browser-direct client above doesn't need them for OpenAI specifically). See "Not implemented yet" below.
 
 With this, every item in the original v0.1 scope is implemented — see [CHANGELOG.md](CHANGELOG.md) for the full build history.
@@ -122,7 +122,7 @@ GET  /voice/sessions/1/turns/5/audio                              -> streamed au
 POST /voice/sessions/1/end    {}                                  -> {"id": 1, "status": "ended"}
 ```
 
-Every session-scoped route 403s for anyone who isn't the session's owner (`VoiceSession::isOwnedBy()`). To allow anonymous callers, set both `voice.routes.allow_guest = true` **and** remove `auth` from `voice.routes.middleware` — a long-lived signed cookie (separate from LaravelEasyAI's own guest cookie) identifies a returning guest, same pattern LaravelEasyAI uses for its chat widget, deliberately kept as an independent config surface so the two packages' access policies can never silently affect each other.
+Every session-scoped route 403s for anyone who isn't the session's owner (`VoiceSession::isOwnedBy()`). To allow anonymous callers, set both `VOICE_ROUTES_ALLOW_GUEST=true` **and** `VOICE_ROUTES_REQUIRE_AUTH=false` in `.env` — a long-lived signed cookie (separate from LaravelEasyAI's own guest cookie) identifies a returning guest, same pattern LaravelEasyAI uses for its chat widget, deliberately kept as an independent config surface so the two packages' access policies can never silently affect each other. `VOICE_ROUTES_REQUIRE_AUTH` is deliberately an env var, not something you hand-edit in the `middleware` array of the published config file — a local test toggle that lives in a config file gets silently lost the next time that file is republished (`vendor:publish --force`), which is exactly the mistake that happened while dogfooding this package and is now fixed at the source.
 
 ## Streaming text responses (opt-in)
 
@@ -358,7 +358,33 @@ VOICE_REALTIME_OPENAI_VOICE=alloy
 
 Publish it with the same `voice-assets` tag as the turn-based widget. `VoiceRealtimeSession` mints a token from `/voice/realtime/token`, then opens a `RTCPeerConnection` **directly from the browser to OpenAI** — Laravel is never in the audio path. `interrupt()` sends OpenAI's `response.cancel` event as an explicit "stop" control; note that OpenAI's own server-side voice-activity detection already auto-interrupts a response when it detects you speaking in the default session config, so `interrupt()` is a backstop, not the only thing making this feel like a real conversation.
 
-**Realtime is provider-selectable, like `voice.stt`/`voice.tts`** — `voice.realtime.default` and `voice.realtime.providers.<name>`, same shape, same reason (so you can choose per your own cost/latency/data-residency needs rather than being locked to one vendor). The token endpoint already accepts a `provider` parameter and `VoiceRealtimeSession` a `provider` option, both defaulting to `voice.realtime.default`. **Only `'openai'` is implemented today** — requesting anything else returns a clear 422 (`/voice/realtime/token`) or throws before connecting (`VoiceRealtimeSession.connect()`), rather than silently misconnecting.
+**Realtime is provider-selectable, like `voice.stt`/`voice.tts`** — `voice.realtime.default` and `voice.realtime.providers.<name>`, same shape, same reason (so you can choose per your own cost/latency/data-residency needs rather than being locked to one vendor). The token endpoint already accepts a `provider` parameter (`'openai'` or `'deepgram'`, both live-verified) and `VoiceRealtimeSession` a `provider` option. **The browser connection client only speaks `'openai'`'s protocol** — Deepgram's Voice Agent API is a raw WebSocket + PCM-audio transport, genuinely different from OpenAI's WebRTC, and has no browser client built yet (only its token-minting half). Requesting an unsupported provider returns a clear 422 (`/voice/realtime/token`) or throws before connecting (`VoiceRealtimeSession.connect()`), rather than silently misconnecting.
+
+<details>
+<summary>Using the Deepgram token endpoint today (token minting only, no browser client yet)</summary>
+
+```env
+VOICE_REALTIME_DEEPGRAM_API_KEY=...   # needs Owner/Admin role (or explicit keys:write scope) -
+                                        # a default/member key gets a live 403 INSUFFICIENT_PERMISSIONS,
+                                        # confirmed against a real account, since minting a scoped
+                                        # key is itself a privileged key-management operation
+```
+
+```js
+const response = await fetch('/voice/realtime/token', {
+    method: 'POST', credentials: 'same-origin',
+    headers: {'X-CSRF-TOKEN': csrfToken, 'Content-Type': 'application/json'},
+    body: JSON.stringify({provider: 'deepgram'}),
+});
+const {token, project_id} = await response.json();
+// A real Deepgram scoped key (scope: usage:write only), project_id auto-resolved
+// from your API key unless voice.realtime.providers.deepgram.project_id is set.
+// Connecting to wss://agent.deepgram.com/ with it is not implemented by this
+// package yet - see DeepgramRealtimeTokenBroker's own docblock for the exact
+// protocol shape if you want to build that client yourself in the meantime.
+```
+
+</details>
 
 <details>
 <summary>Why a second realtime provider (e.g. Together AI's Cartesia Sonic) isn't just a config entry</summary>
@@ -398,7 +424,7 @@ This package assumes it will run in front of real, paid, third-party APIs and ha
 - **Size limits before network calls.** Both STT (file size) and TTS (text length) reject oversized input before making any outbound request.
 - **Private storage by default.** Synthesized audio is written to `voice.storage.disk` (default `local`), never a public disk.
 - **No invented tenancy, but real enforcement once you plug in a resolver.** `tenant_id`/`user_id`/`guest_token` are nullable, FK-less columns — the same posture LaravelEasyAI itself takes, because this package cannot assume your app's tenant model — but once `voice.routes.tenant_resolver` is set, it's actually checked on every request, not just stored.
-- **Routes are opt-in and authenticated by default.** `voice.routes.enabled` defaults to `false`; once enabled, `auth` stays in the middleware list unless you deliberately remove it, and guest access needs a second, explicit flag (`voice.routes.allow_guest`) on top of that.
+- **Routes are opt-in and authenticated by default.** `voice.routes.enabled` defaults to `false`; once enabled, `auth` stays in the middleware list unless you explicitly set `VOICE_ROUTES_REQUIRE_AUTH=false`, and guest access needs a second, explicit flag (`voice.routes.allow_guest`) on top of that.
 - **Errors are redacted before they reach the client.** A provider-side failure over HTTP returns a generic "temporarily unavailable" message and a 502 — the real exception is still logged server-side via `report()`, never echoed back.
 - **Double-checked upload limits.** The HTTP layer validates file size/type before touching disk; the STT provider re-checks independently, so a bypassed or custom-built controller still can't push an oversized file through to a billed API call.
 

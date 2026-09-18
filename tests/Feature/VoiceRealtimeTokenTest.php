@@ -21,6 +21,13 @@ class VoiceRealtimeTokenTest extends TestCase
             'voice' => 'alloy',
             'timeout' => 10,
         ]);
+        $app['config']->set('voice.realtime.providers.deepgram', [
+            'api_key' => 'test-key',
+            'url' => 'https://api.deepgram.com/v1',
+            'project_id' => null,
+            'ttl_seconds' => 3600,
+            'timeout' => 10,
+        ]);
     }
 
     protected function actingAsFakeUser(int $id = 1): FakeUser
@@ -109,7 +116,7 @@ class VoiceRealtimeTokenTest extends TestCase
 
         $this->postJson('/voice/realtime/token', ['provider' => 'together'])
             ->assertStatus(422)
-            ->assertJsonFragment(['error' => "Unsupported realtime provider: together. Only 'openai' is implemented today."]);
+            ->assertJsonFragment(['error' => 'Unsupported realtime provider: together. Supported: openai, deepgram.']);
 
         Http::assertNothingSent();
     }
@@ -126,5 +133,70 @@ class VoiceRealtimeTokenTest extends TestCase
         $this->postJson('/voice/realtime/token')
             ->assertOk()
             ->assertJsonPath('provider', 'openai');
+    }
+
+    public function test_it_mints_a_deepgram_ephemeral_key_resolving_project_id_automatically(): void
+    {
+        $this->actingAsFakeUser();
+
+        Http::fake([
+            'api.deepgram.com/v1/projects' => Http::response([
+                'projects' => [['project_id' => 'proj-123', 'name' => 'Default Project']],
+            ]),
+            'api.deepgram.com/v1/projects/proj-123/keys' => Http::response([
+                'key' => 'dg_scoped_test_key',
+                'api_key_id' => 'key-abc',
+            ]),
+        ]);
+
+        $response = $this->postJson('/voice/realtime/token', ['provider' => 'deepgram']);
+
+        $response->assertOk()
+            ->assertJsonPath('token', 'dg_scoped_test_key')
+            ->assertJsonPath('project_id', 'proj-123')
+            ->assertJsonPath('provider', 'deepgram');
+
+        Http::assertSent(fn ($request) => str_contains($request->url(), '/v1/projects/proj-123/keys')
+            && $request['scopes'] === ['usage:write']);
+    }
+
+    public function test_deepgram_uses_a_configured_project_id_without_calling_projects_endpoint(): void
+    {
+        $this->actingAsFakeUser();
+
+        config(['voice.realtime.providers.deepgram.project_id' => 'configured-project']);
+
+        Http::fake([
+            'api.deepgram.com/v1/projects/configured-project/keys' => Http::response([
+                'key' => 'dg_scoped_test_key',
+            ]),
+        ]);
+
+        $this->postJson('/voice/realtime/token', ['provider' => 'deepgram'])
+            ->assertOk()
+            ->assertJsonPath('project_id', 'configured-project');
+
+        Http::assertNotSent(fn ($request) => str_contains($request->url(), '/v1/projects')
+            && ! str_contains($request->url(), '/keys'));
+    }
+
+    public function test_a_deepgram_key_creation_failure_returns_a_generic_502(): void
+    {
+        $this->actingAsFakeUser();
+
+        Http::fake([
+            'api.deepgram.com/v1/projects' => Http::response([
+                'projects' => [['project_id' => 'proj-123']],
+            ]),
+            'api.deepgram.com/v1/projects/proj-123/keys' => Http::response([
+                'category' => 'INSUFFICIENT_PERMISSIONS',
+                'message' => "Check that your account has the 'keys:write' scope for this project.",
+            ], 403),
+        ]);
+
+        $response = $this->postJson('/voice/realtime/token', ['provider' => 'deepgram']);
+
+        $response->assertStatus(502);
+        $this->assertStringNotContainsString('INSUFFICIENT_PERMISSIONS', $response->getContent());
     }
 }

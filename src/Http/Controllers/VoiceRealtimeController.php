@@ -4,6 +4,7 @@ namespace EasyAI\LaravelVoice\Http\Controllers;
 
 use EasyAI\LaravelVoice\Exceptions\ConnectionException;
 use EasyAI\LaravelVoice\Exceptions\ProviderException;
+use EasyAI\LaravelVoice\Realtime\DeepgramRealtimeTokenBroker;
 use EasyAI\LaravelVoice\Realtime\OpenAiRealtimeTokenBroker;
 use EasyAI\LaravelVoice\Support\VoiceIdentity;
 use Illuminate\Http\JsonResponse;
@@ -12,6 +13,15 @@ use Illuminate\Routing\Controller;
 
 class VoiceRealtimeController extends Controller
 {
+    /**
+     * Token-minting only for both providers - see config/voice.php's own
+     * "realtime" docblock for why 'openai' (WebRTC) and 'deepgram' (raw
+     * WebSocket + PCM) can share this endpoint's shape even though their
+     * actual browser connections are completely different protocols with
+     * no client built for the latter yet.
+     */
+    private const SUPPORTED_PROVIDERS = ['openai', 'deepgram'];
+
     public function token(Request $request): JsonResponse
     {
         [$userId, $guestToken] = VoiceIdentity::resolve($request);
@@ -28,22 +38,23 @@ class VoiceRealtimeController extends Controller
             'provider' => ['nullable', 'string', 'max:40'],
             'model' => ['nullable', 'string', 'max:100'],
             'voice' => ['nullable', 'string', 'max:50'],
+            'ttl_seconds' => ['nullable', 'integer', 'min:10', 'max:3600'],
         ]);
 
         $provider = $validated['provider'] ?? config('voice.realtime.default', 'openai');
 
-        // Only 'openai' exists today - see config/voice.php's own
-        // "realtime" docblock for exactly what a second provider would
-        // need before it could be added here. Requesting an unsupported
-        // one is a client error (422), not a 502 - nothing was even
-        // attempted, so it's not a provider failure.
-        if ($provider !== 'openai') {
+        // Requesting an unsupported provider is a client error (422), not
+        // a 502 - nothing was even attempted, so it's not a provider
+        // failure.
+        if (! in_array($provider, self::SUPPORTED_PROVIDERS, true)) {
             return response()->json([
-                'error' => "Unsupported realtime provider: {$provider}. Only 'openai' is implemented today.",
+                'error' => "Unsupported realtime provider: {$provider}. Supported: ".implode(', ', self::SUPPORTED_PROVIDERS).'.',
             ], 422);
         }
 
-        $broker = new OpenAiRealtimeTokenBroker(config('voice.realtime.providers.openai', []));
+        $broker = $provider === 'deepgram'
+            ? new DeepgramRealtimeTokenBroker(config('voice.realtime.providers.deepgram', []))
+            : new OpenAiRealtimeTokenBroker(config('voice.realtime.providers.openai', []));
 
         try {
             $result = $broker->createEphemeralToken($validated);

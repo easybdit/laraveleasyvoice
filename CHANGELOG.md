@@ -4,6 +4,20 @@
 
 Per-phase entries, same convention as v0.1's build-up — logged as work lands on `main`, tagged as a release only once enough has accumulated to justify a version bump (not after every phase). See "v0.1.0" further down for what's already tagged and published.
 
+### 📡 Phase 14: Deepgram realtime token minting, live-verified + a recurring config bug fixed at the source
+
+Two independent items from the same testing session, both found by actually using the package against real accounts rather than assumed correct.
+
+**1. `Realtime\DeepgramRealtimeTokenBroker`** — mints a short-lived, scoped Deepgram API key server-side, the Deepgram equivalent of Phase 10's `OpenAiRealtimeTokenBroker`, now wired into `/voice/realtime/token` as a selectable `provider` alongside `'openai'`. Two real issues found via live testing, neither caught by documentation review alone:
+1. `scopes` is documented as optional on the create-key endpoint; a live call proved it's required (`400 INVALID_JSON: missing field \`scopes\``). Fixed by defaulting to `['usage:write']` - the minimal scope needed to actually use the API, deliberately not the broader `keys:write` or `member`.
+2. Creating a scoped key is itself a privileged operation - the *calling* key (the real account key configured server-side) needs `keys:write`/Owner permission, which a default/member-role key does not have (confirmed live: `403 INSUFFICIENT_PERMISSIONS`). Not a bug in this package; documented as a real setup step (generate a key with Owner role specifically for this).
+
+A full successful mint has been confirmed live against a real Deepgram account once that permission was granted. **What's still explicitly not built**: any browser client for the actual Voice Agent connection. Unlike OpenAI's WebRTC handshake (which `voice-realtime.js` already implements), Deepgram's Voice Agent API is a raw WebSocket streaming linear16 PCM audio frames, authenticated via the `Sec-WebSocket-Protocol` header rather than a normal bearer token - a genuinely different client than the one that exists today. Only the token-minting half is done.
+
+**2. Fixed a config bug that had already caused real, repeated confusion**: `voice.routes.middleware` hardcoded `'auth'` into the array. Toggling it off for local guest testing meant hand-editing the *published* `config/voice.php` - an edit that silently vanished, breaking guest access again, every time `vendor:publish --tag=voice-config --force` ran (which happened routinely while adding new provider config sections during this same testing session, more than once). Fixed by computing `'auth'`'s presence from a new `VOICE_ROUTES_REQUIRE_AUTH` env var (default `true`) instead of hardcoding it - the toggle now lives in `.env`, which republishing never touches. Added `tests/Unit/VoiceRoutesConfigTest.php` (a new `Unit` test suite, evaluating the raw config file directly with no Laravel app needed) as a regression test, specifically because this exact mistake had already recurred more than once without one.
+
+9 new/updated tests for the Deepgram broker and controller, 2 new unit tests for the config fix. 66 tests, 170 assertions, all passing.
+
 ### 🔎 Phase 13: surface OpenAI's real error on a failed realtime connection
 
 Found during the first live browser test against a real OpenAI account: token minting succeeded, but the actual WebRTC handshake (`POST /v1/realtime/calls`) returned `HTTP 429` - and `VoiceRealtimeSession.connect()` was throwing away the response body, leaving only the status code to diagnose with. That matters specifically for `429`, which OpenAI overloads to mean either genuine rate-limiting *or* "insufficient quota / no billing configured" - the two have very different fixes, and only the response body text tells you which. Fixed: the body is now read and included in the thrown error.
