@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### 🧪 Phase 21: tool-calling verified through the real HTTP turn endpoint
+
+Every existing tool-calling test up to this point - the Phase 6 `AuthorizedTool` tests, `VoiceAgentTest`, Phase 20's `VoiceAgentDeepgramToolsTest` - called `VoiceAgent::handleTurn()` directly; none exercised the actual public HTTP surface, `POST /voice/sessions` → `POST /voice/sessions/{id}/turns`. This was named explicitly as a deferred item in Phase 20's own scope notes. This phase closes it: `tests/Feature/VoiceHttpToolsTest.php` (2 new tests) proves `AuthorizedTool`-based tool-calling survives the real HTTP path - auth/ownership middleware, a real multipart audio upload, and `VoiceTurnController::store()`'s JSON response - not just the orchestrator level.
+
+Covers: (1) a successful tool call - the JSON response's `tool_calls` array carries the executed tool's name and tier, the assistant `voice_turns` row persists as `completed`, and the synthesized audio is fetchable via its returned `audio_url`; (2) a Gate-denied tool - the handler never runs, the denial is reflected in the model's final response, and the turn still completes and returns 200, exactly like the same denial case already proven at the orchestrator level in Phase 20.
+
+**Both tests passed against the existing implementation on the first run - no bug found, no production code touched.** Full suite: 118 tests, 349 assertions, all passing (2 intentionally skipped - the Phase 1/2 live-API integration tests, absent a real key).
+
 ### 🔧 Phase 20: tool-calling verified through the full VoiceAgent pipeline with Deepgram + Together
 
 Phase 19 proved the STT/TTS pipeline is provider-agnostic; this phase asks the same question about tool-calling specifically - does `AuthorizedTool`'s Gate-guarded handler, LaravelEasyAI's `Tool::execute()` catch-all, and the full `ToolCallStarted`/`ToolCallCompleted` event pair still work correctly when routed through `stt('deepgram')`/`tts('deepgram')`/`llm('together')`, rather than the OpenAI-only combination every existing tool-calling test used. Test-only, same posture as Phase 19: `tests/Feature/VoiceAgentDeepgramToolsTest.php` (3 new tests), zero production source changes.
