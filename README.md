@@ -134,6 +134,31 @@ multipart: audio=<file>
 
 A key already tied to a turn still being processed returns `409`; a key tied to one that already finished returns the original result again, unchanged. A key already tied to one that failed returns that same failure — retrying under that exact key is not re-attempted, so use a new key if you genuinely want to try again. Omit the header entirely for the exact behavior this package has always had.
 
+**Recovering from a crashed attempt:** if the process handling a turn dies mid-flight (a killed worker, a server restart) before it ever reaches a final `completed`/`failed` state, its row is left stuck at `pending`. A retry sent with that *same* `Idempotency-Key`, once the stuck row has been `pending` for longer than `voice.turn_recovery.stale_after_seconds` (`VOICE_TURN_STALE_AFTER_SECONDS`, default 300 seconds), safely resumes it instead of returning `409` forever:
+
+- If STT itself never finished, it runs again from your retry's audio.
+- If STT already finished and persisted a transcript, it is **not** re-run — only the LLM/tool-calling/TTS portion resumes, reusing that same transcript.
+- A `409` still applies to a `pending` turn that hasn't been stuck for longer than the threshold — a genuinely slow but still-alive attempt is never mistaken for an abandoned one.
+
+`stale_after_seconds` is a timestamp-based heuristic, not a computed safe value — it has no way to distinguish a crashed process from one that's simply still working, and the shipped default of 300 seconds is **not** guaranteed to be enough for every legitimate turn. Concretely, this package's own shipped defaults alone already sum to more than 300 seconds in the worst case, before your agent's own tools are even counted:
+
+| Stage | Shipped default | Worst case |
+|---|---|---|
+| STT | 60s timeout × 2 attempts | ~120s |
+| LLM/tool loop | 60s timeout/call × `maxSteps` (5) | ~300s |
+| TTS | 60s timeout × 2 attempts | ~120s |
+| **Combined provider-timeout budget** | | **~540s** |
+
+That ~540s is the sum of the shipped provider-timeout *budgets*, not a guaranteed absolute ceiling — a real turn usually finishes far faster, but nothing stops it from using the full budget against a slow provider or a loaded model. On top of it, every tool call your agent makes runs your own closure (`Tool::execute()`) with **no timeout enforced anywhere** in this package or in LaravelEasyAI, so real tool-handler latency (a database query, an external API call) can push the true worst case higher still.
+
+Set `VOICE_TURN_STALE_AFTER_SECONDS` above the real maximum time one of your own turns can legitimately take — computed from *your* configured STT/TTS timeouts and retries, *your* agent's `maxSteps` and LLM provider timeout, and *your* slowest tool handler's expected duration, plus a safety margin — before relying on this in production. Leaving every default untouched is not, by itself, a safe configuration for this setting; this package has no reliable way to know your configured LLM provider's own timeout or your tools' real latency, so it does not guess a safe value for you.
+
+**Recovery is at-least-once, not exactly-once:** if a stale attempt is recovered after its LLM step already called a tool, that tool may run again — there is no way for this package to know whether an arbitrary tool handler's own external side effect (an email sent, a record charged) already happened right before the original process died. Any tool with a real side effect should be made idempotent by the application itself (e.g. accept and de-duplicate on its own idempotency argument) — this package does not and cannot solve that for you.
+
+This same at-least-once boundary applies to provider usage/cost accounting, not just tool side effects: a provider call can succeed — and be billed by the provider — moments before the process handling it crashes, before this package ever gets to record that call's usage. Recovery may then run that same provider work again. Because usage/cost is persisted incrementally as each step completes (not batched until the whole turn finishes), an abandoned attempt's already-recorded partial usage is never rolled back or deduplicated against the attempt that eventually succeeds — `voice_sessions.total_prompt_tokens`/`total_completion_tokens`/`estimated_cost` can therefore end up reflecting more than one execution's worth of work for what is, from the caller's side, a single logical turn. This package does not claim exactly-once billing across a crash/recovery boundary — it is an inherent limitation of recovering from a crash without a distributed lease/coordination system, not a bug to be silently papered over.
+
+Every write this package makes to a turn or its session counters after a recovery attempt begins is itself ownership-fenced: if another execution has already reclaimed a turn, an execution that was merely slow (not actually dead) is prevented from overwriting the recovered result or crediting usage for work whose outcome was already discarded — it stops and raises a conflict instead. What is *not* prevented, and cannot be, is a genuine provider-side charge that already happened before that detection.
+
 ## Streaming text responses (opt-in)
 
 ```php

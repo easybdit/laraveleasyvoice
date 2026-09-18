@@ -198,6 +198,64 @@ return [
 
     /*
     |--------------------------------------------------------------------
+    | Stale turn recovery
+    |--------------------------------------------------------------------
+    |
+    | A voice turn's owning PHP process can disappear mid-flight (a crash,
+    | a killed worker, a server restart) and leave its row stuck at
+    | 'pending' forever. A retry sent with the SAME Idempotency-Key as
+    | that stuck turn is only ever allowed to reclaim it once it has been
+    | 'pending' for longer than this threshold - never sooner, since a
+    | genuinely slow (but still alive) attempt must not be mistaken for
+    | an abandoned one.
+    |
+    | There is no safe default this package can compute for you: STT/TTS
+    | each have their own configurable timeout above (voice.stt/voice.tts),
+    | but the LLM/tool-calling portion's own timeout is owned entirely by
+    | whichever LaravelEasyAI provider you've configured, which this
+    | package has no reliable way to inspect - guessing it would risk
+    | reclaiming a turn that's still genuinely in progress. The 300
+    | seconds below is a timestamp-based heuristic, not a computed safe
+    | value - it cannot distinguish a crashed process from a legitimately
+    | slow one, and 300 is NOT guaranteed to be enough for every turn.
+    |
+    | Concretely, this package's own SHIPPED DEFAULTS already sum to more
+    | than 300 seconds in the worst case, before your own agent's tools
+    | are even counted:
+    |   - STT: voice.stt's default timeout (60s) x its default retries
+    |     (2 total attempts)                          ~120s
+    |   - LLM/tool loop: LaravelEasyAI's default per-call timeout (60s)
+    |     x VoiceAgent's default maxSteps (5)          ~300s
+    |   - TTS: voice.tts's default timeout (60s) x its default retries
+    |     (2 total attempts)                          ~120s
+    |   ------------------------------------------------------------
+    |     Combined shipped provider-timeout budget:    ~540s
+    |
+    | That ~540s is the sum of the shipped provider-timeout budgets, not
+    | a guaranteed absolute ceiling on how long a turn can legitimately
+    | run - a real turn will usually finish far faster, but nothing stops
+    | it from using its full configured timeout budget on a slow provider
+    | or a loaded model. On top of it, each tool call your agent makes
+    | runs an arbitrary host-app closure (Tool::execute()) with NO
+    | timeout imposed anywhere in this package or in LaravelEasyAI, so
+    | real tool-handler latency (a database query, an external API call)
+    | can extend the true worst case further still.
+    |
+    | You must set this above the real maximum time one of your own
+    | turns can legitimately take - computed from YOUR OWN configured
+    | STT/TTS timeouts and retries, YOUR agent's maxSteps and LLM
+    | provider timeout, and YOUR slowest tool handler's expected
+    | duration - plus a safety margin, before relying on this in
+    | production. Leaving every default untouched is not, by itself, a
+    | safe configuration for this setting.
+    |
+    */
+    'turn_recovery' => [
+        'stale_after_seconds' => env('VOICE_TURN_STALE_AFTER_SECONDS', 300),
+    ],
+
+    /*
+    |--------------------------------------------------------------------
     | Realtime (ephemeral token minting only)
     |--------------------------------------------------------------------
     |

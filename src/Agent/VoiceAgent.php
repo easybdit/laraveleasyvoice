@@ -13,9 +13,11 @@ use EasyAI\LaravelVoice\Events\SessionStarted;
 use EasyAI\LaravelVoice\Events\SpeechTranscribed;
 use EasyAI\LaravelVoice\Events\ToolCallCompleted;
 use EasyAI\LaravelVoice\Events\ToolCallStarted;
+use EasyAI\LaravelVoice\Events\TurnRecovered;
 use EasyAI\LaravelVoice\Events\VoiceError;
 use EasyAI\LaravelVoice\Exceptions\ConnectionException;
 use EasyAI\LaravelVoice\Exceptions\ProviderException;
+use EasyAI\LaravelVoice\Exceptions\TurnOwnershipLostException;
 use EasyAI\LaravelVoice\Exceptions\VoiceException;
 use EasyAI\LaravelVoice\Exceptions\VoiceLimitExceededException;
 use EasyAI\LaravelVoice\Models\VoiceSession;
@@ -202,7 +204,16 @@ class VoiceAgent
      * $options['idempotency_key'] (optional): identifies one logical turn
      * attempt. A second call with the same key for the same session never
      * re-runs STT/LLM/tools/TTS or charges usage twice - see
-     * claimNextTurn()/resolveDuplicateTurn() for the exact contract.
+     * claimNextTurn()/resolveExistingClaim() for the exact contract,
+     * including how a stale (owning-process-gone) pending turn is safely
+     * recovered rather than left stuck forever.
+     *
+     * At-least-once, not exactly-once: if a stale attempt is recovered
+     * after its LLM step already called a tool, that tool may be called
+     * again - this package has no way to know whether an arbitrary tool
+     * handler's own external side effect already happened before the
+     * original process died. Tool-level idempotency for anything with a
+     * real side effect is the consuming application's own responsibility.
      */
     public function handleTurn(VoiceSession $session, string $audioFilePath, array $options = []): VoiceTurn
     {
@@ -233,17 +244,48 @@ class VoiceAgent
             throw new VoiceLimitExceededException($claim['message']);
         }
 
-        if ($claim['outcome'] === 'duplicate') {
-            return $this->resolveDuplicateTurn($session, $claim['userTurn']);
+        if ($claim['outcome'] === 'duplicate_completed' || $claim['outcome'] === 'duplicate_failed') {
+            return $this->resolveDuplicateTurn($claim);
         }
 
+        if ($claim['outcome'] === 'duplicate_pending') {
+            throw new VoiceException('A turn for this idempotency key is still processing.');
+        }
+
+        if ($claim['outcome'] === 'recover_assistant_turn') {
+            // The user turn already completed on the abandoned attempt -
+            // its transcript is real, paid-for work; STT is never repeated
+            // for it. Only the LLM/tool/TTS portion resumes, reusing the
+            // SAME (just-reclaimed) assistant turn row rather than
+            // creating a new one - no new sequence, no idempotency-key
+            // collision.
+            $userTurn = $claim['userTurn'];
+            $assistantTurn = $claim['assistantTurn'];
+
+            event(new TurnRecovered($session, $assistantTurn, 'llm'));
+
+            return $this->runLlmAndTts($session, $userTurn, $assistantTurn, (string) $userTurn->transcript, $options);
+        }
+
+        // 'proceed' (a genuinely new turn) and 'recover_user_turn' (a
+        // stale, never-completed user turn reclaimed onto the SAME row)
+        // both run STT from here - the only difference is whether
+        // $userTurn is a freshly created row or a reclaimed existing one;
+        // the rest of the pipeline is identical either way.
         $sequence = $claim['sequence'];
         $userTurn = $claim['userTurn'];
+
+        if ($claim['outcome'] === 'recover_user_turn') {
+            event(new TurnRecovered($session, $userTurn, 'stt'));
+        }
 
         try {
             $transcription = $this->voice->stt($this->sttDriver)->transcribe($audioFilePath, $options['stt'] ?? []);
         } catch (\Throwable $e) {
-            $userTurn->update(['status' => 'failed', 'error_message' => $e->getMessage()]);
+            if (! $this->guardedTurnUpdate($userTurn, ['status' => 'failed', 'error_message' => $e->getMessage()])) {
+                throw $this->ownershipLostException($userTurn);
+            }
+
             event(new VoiceError($session, 'stt', $e));
 
             throw $e;
@@ -253,11 +295,21 @@ class VoiceAgent
             ? (int) round($transcription->durationSeconds * 1000)
             : null;
 
-        $userTurn->update([
+        // Guarded, not a plain update(): a slow-but-still-alive original
+        // execution reaching this line AFTER another execution has
+        // already reclaimed $userTurn (see reclaim()) must not be able to
+        // silently overwrite the recovered attempt's own result, nor
+        // charge STT usage for work whose outcome was already discarded.
+        // 0 affected rows means exactly that has happened - this
+        // execution no longer owns the turn, and must stop here rather
+        // than proceed to create an assistant turn or touch the session.
+        if (! $this->guardedTurnUpdate($userTurn, [
             'transcript' => $transcription->text,
             'audio_duration_ms' => $sttDurationMs,
             'status' => 'completed',
-        ]);
+        ])) {
+            throw $this->ownershipLostException($userTurn);
+        }
 
         if ($sttDurationMs !== null) {
             $session->increment('total_stt_ms', $sttDurationMs);
@@ -272,11 +324,23 @@ class VoiceAgent
             'status' => 'pending',
         ]);
 
+        return $this->runLlmAndTts($session, $userTurn, $assistantTurn, $transcription->text, $options);
+    }
+
+    /**
+     * The LLM/tool-calling loop plus TTS - extracted from handleTurn()
+     * unchanged in behavior, only parameterized by the already-persisted
+     * transcript text rather than reading it off a freshly-completed STT
+     * call, so a recovered assistant turn (STT already done on a prior,
+     * abandoned attempt) can resume here directly without repeating STT.
+     */
+    protected function runLlmAndTts(VoiceSession $session, VoiceTurn $userTurn, VoiceTurn $assistantTurn, string $transcriptText, array $options): VoiceTurn
+    {
         try {
             $started = microtime(true);
 
-            $messages = $this->buildMessageHistory($session, $sequence);
-            $messages[] = ['role' => 'user', 'content' => $transcription->text];
+            $messages = $this->buildMessageHistory($session, $userTurn->sequence);
+            $messages[] = ['role' => 'user', 'content' => $transcriptText];
 
             $provider = AI::provider($this->llmProvider);
 
@@ -304,28 +368,35 @@ class VoiceAgent
             // A tool-calling turn makes more than one real LLM call, each
             // with its own usage - run() only ever returns the LAST step's
             // response, so reading getPromptTokens()/getCompletionTokens()/
-            // getEstimatedCost() off it alone silently drops every earlier
-            // step's usage. $onStep (added alongside $onToolCall/$onChunk)
-            // fires once per step with that step's real AIResponse, so
-            // every step's usage/cost is accumulated here instead - for an
-            // ordinary single-step turn this fires exactly once and these
-            // totals are identical to reading them off the final response
-            // directly, same as before.
-            $stepPromptTokens = 0;
-            $stepCompletionTokens = 0;
-            $stepCost = null;
+            // getEstimatedCost() off it alone would silently drop every
+            // earlier step's usage. $onStep fires once per step with that
+            // step's real AIResponse - each step's usage/cost is persisted
+            // atomically HERE, immediately, rather than accumulated in a
+            // local variable and written once at the end: if the process
+            // dies partway through a multi-step tool-calling loop, whatever
+            // steps already ran are not silently lost from the session's
+            // running totals. For an ordinary single-step turn this still
+            // fires exactly once, with the same net effect as before.
+            //
+            // Ownership-checked first: a multi-step loop can run long
+            // enough for another execution to have reclaimed
+            // $assistantTurn since this one started (see reclaim()) -
+            // stillOwnsTurn() catches that before crediting a step whose
+            // result this execution's own turn row no longer represents.
+            // Throwing here stops the loop immediately (run() calls
+            // $onStep with nothing wrapping it - see AbstractDriver::run()),
+            // so no further step runs and TTS is never reached either.
+            $onStep = function ($stepResponse) use ($session, $assistantTurn) {
+                if (! $this->stillOwnsTurn($assistantTurn)) {
+                    throw $this->ownershipLostException($assistantTurn);
+                }
 
-            $onStep = function ($stepResponse) use (&$stepPromptTokens, &$stepCompletionTokens, &$stepCost) {
-                $stepPromptTokens += $stepResponse->getPromptTokens();
-                $stepCompletionTokens += $stepResponse->getCompletionTokens();
+                $session->increment('total_prompt_tokens', $stepResponse->getPromptTokens());
+                $session->increment('total_completion_tokens', $stepResponse->getCompletionTokens());
 
                 // getEstimatedCost() is null unless a rate is configured for
                 // that step's exact provider/model - never invented here.
-                // Mirrors accumulateCost()'s own null-safe accumulation: if
-                // no step ever has a configured rate, $stepCost stays null.
-                if (($cost = $stepResponse->getEstimatedCost()) !== null) {
-                    $stepCost = ($stepCost ?? 0) + $cost;
-                }
+                $this->accumulateCost($session, $stepResponse->getEstimatedCost());
             };
 
             // Exposes the active session to a tool's handler for the exact
@@ -365,20 +436,29 @@ class VoiceAgent
 
             $latencyMs = (int) round((microtime(true) - $started) * 1000);
 
-            $assistantTurn->update([
+            if (! $this->guardedTurnUpdate($assistantTurn, [
                 'transcript' => $response->getContent(),
                 'tool_calls' => $toolCallLog ?: null,
                 'latency_ms' => $latencyMs,
                 'status' => 'completed',
-            ]);
-
-            $session->increment('total_prompt_tokens', $stepPromptTokens);
-            $session->increment('total_completion_tokens', $stepCompletionTokens);
-            $this->accumulateCost($session, $stepCost);
+            ])) {
+                throw $this->ownershipLostException($assistantTurn);
+            }
 
             $this->mirrorIntoChatHistory($session, $userTurn, $assistantTurn);
+        } catch (TurnOwnershipLostException $e) {
+            // Already lost ownership before or during this try block - the
+            // write that would normally record a failure below is skipped
+            // entirely: it isn't this execution's row anymore, and firing
+            // VoiceError('llm', ...) here would misleadingly describe a
+            // genuine LLM failure for a turn another execution may since
+            // have completed successfully.
+            throw $e;
         } catch (\Throwable $e) {
-            $assistantTurn->update(['status' => 'failed', 'error_message' => $e->getMessage()]);
+            if (! $this->guardedTurnUpdate($assistantTurn, ['status' => 'failed', 'error_message' => $e->getMessage()])) {
+                throw $this->ownershipLostException($assistantTurn);
+            }
+
             event(new VoiceError($session, 'llm', $e));
 
             // AI::provider()->run() throws LaravelEasyAI's OWN exception
@@ -406,10 +486,12 @@ class VoiceAgent
                 ? (int) round($audio->durationSeconds * 1000)
                 : null;
 
-            $assistantTurn->update([
+            if (! $this->guardedTurnUpdate($assistantTurn, [
                 'audio_path' => $path,
                 'audio_duration_ms' => $ttsDurationMs,
-            ]);
+            ])) {
+                throw $this->ownershipLostException($assistantTurn);
+            }
 
             if ($ttsDurationMs !== null) {
                 $session->increment('total_tts_ms', $ttsDurationMs);
@@ -418,8 +500,12 @@ class VoiceAgent
             event(new ResponseSynthesized($session, $assistantTurn));
         } catch (\Throwable $e) {
             // The LLM's text answer is already saved - a TTS failure never
-            // discards it. The caller can still show/return the text.
-            event(new VoiceError($session, 'tts', $e));
+            // discards it. The caller can still show/return the text. Not
+            // fired for an ownership-loss exception - that isn't a genuine
+            // TTS failure and attributing one to this turn would mislead.
+            if (! $e instanceof TurnOwnershipLostException) {
+                event(new VoiceError($session, 'tts', $e));
+            }
 
             throw $e;
         }
@@ -485,9 +571,10 @@ class VoiceAgent
 
     /**
      * The entire locked, DB-only claim step for one handleTurn() call:
-     * lock the session row, resolve an idempotency-key duplicate if one
-     * was given, enforce maxTurns/maxSessionSeconds, and - only once none
-     * of that short-circuits - claim the next sequence and insert the
+     * lock the session row, resolve an idempotency-key duplicate (or a
+     * stale-turn recovery - see resolveExistingClaim()) if a key was
+     * given, enforce maxTurns/maxSessionSeconds, and - only once none of
+     * that short-circuits - claim the next sequence and insert the
      * pending user turn. Everything here is a fast local read/write; STT/
      * LLM/tool-calling/TTS all happen after this method returns and the
      * transaction has released the lock, never inside it.
@@ -500,8 +587,9 @@ class VoiceAgent
      * transaction has committed.
      *
      * @return array{outcome: 'proceed', sequence: int, userTurn: VoiceTurn}
-     *       | array{outcome: 'duplicate', userTurn: VoiceTurn}
      *       | array{outcome: 'limit_exceeded', message: string}
+     *       | (see resolveExistingClaim() for every outcome an existing
+     *          idempotency-key match can produce)
      */
     protected function claimNextTurn(VoiceSession $session, ?string $idempotencyKey): array
     {
@@ -512,6 +600,9 @@ class VoiceAgent
             // asking "what happened to my earlier request?" gets an
             // answer regardless of whether the session has since ended,
             // rather than being told the session isn't usable anymore.
+            // Still fully inside this same lock, so the whole decision -
+            // including a stale-turn reclaim - is atomic with respect to
+            // any other handleTurn() call for this session.
             if ($idempotencyKey !== null) {
                 $existingUserTurn = VoiceTurn::query()
                     ->where('voice_session_id', $locked->id)
@@ -519,7 +610,7 @@ class VoiceAgent
                     ->first();
 
                 if ($existingUserTurn !== null) {
-                    return ['outcome' => 'duplicate', 'userTurn' => $existingUserTurn];
+                    return $this->resolveExistingClaim($session, $existingUserTurn);
                 }
             }
 
@@ -563,22 +654,49 @@ class VoiceAgent
     }
 
     /**
-     * A second handleTurn() call with an idempotency key already claimed
-     * by an earlier attempt for this session. Never touches STT, the LLM/
-     * tool loop, or TTS, and never creates another turn or consumes
-     * another sequence number - only reads what the original attempt
-     * already persisted.
+     * Called from inside claimNextTurn()'s transaction/lock, for a key
+     * that already matches an existing user turn. Determines the real
+     * outcome - never from the user turn alone: an LLM failure leaves the
+     * user turn 'completed' (STT succeeded) with the *assistant* turn
+     * 'failed', and a TTS failure leaves the assistant turn 'completed'
+     * with a null audio_path (existing, unchanged behavior) - so the
+     * paired assistant turn (sequence = user turn's sequence + 1,
+     * guaranteed unique by the Phase 9A index) is always consulted too.
      *
-     * The user turn alone is not enough to know the real outcome: an LLM
-     * failure leaves the user turn 'completed' (STT succeeded) with the
-     * *assistant* turn 'failed', and a TTS failure leaves the assistant
-     * turn 'completed' with a null audio_path (existing, unchanged
-     * behavior) - so the paired assistant turn (sequence = user turn's
-     * sequence + 1, guaranteed unique by the Phase 9A index) is always
-     * consulted too.
+     * A genuinely stale 'pending' row (user or assistant) is reclaimed
+     * right here, atomically, via reclaim() - never a read-then-act
+     * check. A turn that's 'pending' but not yet stale returns
+     * 'duplicate_pending' exactly as before Phase 9C. A stale completed
+     * user turn whose assistant turn was never created (see the
+     * $assistantTurn === null branch below) is handled the same way in
+     * spirit, staleness checked against the user turn's own updated_at
+     * since there is no 'pending' row for reclaim() itself to act on.
+     *
+     * @return array{outcome: 'duplicate_completed'|'duplicate_failed', turn: VoiceTurn}
+     *       | array{outcome: 'duplicate_pending'}
+     *       | array{outcome: 'recover_user_turn', sequence: int, userTurn: VoiceTurn}
+     *       | array{outcome: 'recover_assistant_turn', userTurn: VoiceTurn, assistantTurn: VoiceTurn}
      */
-    protected function resolveDuplicateTurn(VoiceSession $session, VoiceTurn $userTurn): VoiceTurn
+    protected function resolveExistingClaim(VoiceSession $session, VoiceTurn $userTurn): array
     {
+        $staleCutoff = now()->subSeconds((int) config('voice.turn_recovery.stale_after_seconds', 300));
+
+        if ($userTurn->status === 'pending') {
+            if (! $this->reclaim($userTurn, $staleCutoff)) {
+                return ['outcome' => 'duplicate_pending'];
+            }
+
+            // Reclaimed onto the SAME row - no new turn, no new sequence,
+            // the idempotency key is untouched (it still belongs to this
+            // same logical attempt).
+            return ['outcome' => 'recover_user_turn', 'sequence' => $userTurn->sequence, 'userTurn' => $userTurn->fresh()];
+        }
+
+        if ($userTurn->status === 'failed') {
+            return ['outcome' => 'duplicate_failed', 'turn' => $userTurn];
+        }
+
+        // $userTurn->status === 'completed' from here.
         $assistantTurn = VoiceTurn::query()
             ->where('voice_session_id', $session->id)
             ->where('sequence', $userTurn->sequence + 1)
@@ -586,24 +704,210 @@ class VoiceAgent
             ->first();
 
         if ($assistantTurn === null) {
-            // No assistant turn yet - either STT is still running, or it
-            // already failed and the loop never got that far.
-            if ($userTurn->status === 'failed') {
-                throw new VoiceException($userTurn->error_message ?: 'This request previously failed and will not be retried under the same idempotency key.');
+            // STT completed but the assistant turn was never even created
+            // - the owning process died in the gap between the two
+            // writes. Nothing 'pending' exists here for reclaim() to act
+            // on, so staleness is checked directly against the user
+            // turn's own updated_at instead: fresh (STT genuinely just
+            // finished a moment ago, the assistant turn simply hasn't
+            // been created yet) is still 'still processing', unchanged
+            // from before Phase 9C's stale-completed-user-turn handling.
+            if (! $userTurn->updated_at->lt($staleCutoff)) {
+                return ['outcome' => 'duplicate_pending'];
             }
 
-            throw new VoiceException('A turn for this idempotency key is still processing.');
+            // Stale - safe to create the missing assistant turn here:
+            // this whole method runs inside claimNextTurn()'s existing
+            // session-row lock, so a second, simultaneous same-key retry
+            // blocks until this transaction commits, then sees the row
+            // this call is about to create rather than racing to create
+            // a second one for the same sequence. A defensive catch
+            // remains for the narrow, pre-existing case where an
+            // unrelated turn (a different key, created and committed
+            // while this one sat stuck) already claimed this exact
+            // sequence number - conflict is reported rather than a raw
+            // database error.
+            //
+            // Narrowed to SQLSTATE 23000 (the integrity-constraint-
+            // violation class MySQL, MariaDB, SQLite, and PostgreSQL all
+            // report a unique/foreign-key conflict under) specifically -
+            // not every QueryException. A lost connection, a deadlock, a
+            // disk-full error, or any other genuine database failure at
+            // this exact call site must still surface as a real error,
+            // never be silently reinterpreted as "someone else already
+            // has this," which would hide an actual outage behind a
+            // misleadingly benign 409.
+            try {
+                $assistantTurn = VoiceTurn::create([
+                    'voice_session_id' => $session->id,
+                    'sequence' => $userTurn->sequence + 1,
+                    'speaker' => 'assistant',
+                    'status' => 'pending',
+                ]);
+            } catch (\Illuminate\Database\QueryException $e) {
+                if ($e->getCode() !== '23000') {
+                    throw $e;
+                }
+
+                return ['outcome' => 'duplicate_pending'];
+            }
+
+            return ['outcome' => 'recover_assistant_turn', 'userTurn' => $userTurn, 'assistantTurn' => $assistantTurn];
         }
 
         if ($assistantTurn->status === 'failed') {
-            throw new VoiceException($assistantTurn->error_message ?: 'This request previously failed and will not be retried under the same idempotency key.');
+            return ['outcome' => 'duplicate_failed', 'turn' => $assistantTurn];
         }
 
-        if ($assistantTurn->status !== 'completed') {
-            throw new VoiceException('A turn for this idempotency key is still processing.');
+        if ($assistantTurn->status === 'completed') {
+            return ['outcome' => 'duplicate_completed', 'turn' => $assistantTurn];
         }
 
-        return $assistantTurn;
+        // $assistantTurn->status === 'pending' from here.
+        if (! $this->reclaim($assistantTurn, $staleCutoff)) {
+            return ['outcome' => 'duplicate_pending'];
+        }
+
+        return ['outcome' => 'recover_assistant_turn', 'userTurn' => $userTurn, 'assistantTurn' => $assistantTurn->fresh()];
+    }
+
+    /**
+     * The one atomic, DB-level reclaim operation Phase 9C relies on: a
+     * single UPDATE with `status = 'pending' AND updated_at < $staleCutoff`
+     * in its WHERE clause. Returns whether THIS call won the reclaim - 0
+     * affected rows means the row wasn't actually stale (a legitimately
+     * in-flight attempt, still within the configured threshold), or
+     * another request already reclaimed/changed it a moment ago. This is
+     * never a read-then-act check: the condition and the write happen in
+     * one database round trip, so there is no window for a second caller
+     * to observe "not yet reclaimed" and also win. (On SQLite, which has
+     * no real row-level lock, this single atomic UPDATE is the only thing
+     * that actually prevents two callers from both believing they won;
+     * under MySQL/MariaDB it's additionally covered by the session-row
+     * lock claimNextTurn() already holds - see that method's own
+     * docblock. Real concurrent-process behavior under InnoDB is not and
+     * cannot be proven by this SQLite-based test suite.)
+     *
+     * The abandoned attempt is marked 'interrupted' - reusing the
+     * existing, already-defined-but-previously-unused status value rather
+     * than adding a new one - then immediately reset to 'pending' with a
+     * fresh updated_at for the new attempt that's about to run on this
+     * same row. By the time reclaim() returns true, no further race is
+     * possible (the affected-rows check already proved exclusive
+     * ownership), so that second write needs no condition of its own.
+     */
+    protected function reclaim(VoiceTurn $turn, \DateTimeInterface $staleCutoff): bool
+    {
+        $affected = VoiceTurn::query()
+            ->whereKey($turn->id)
+            ->where('status', 'pending')
+            ->where('updated_at', '<', $staleCutoff)
+            ->update(['status' => 'interrupted']);
+
+        if ($affected === 0) {
+            return false;
+        }
+
+        $turn->update(['status' => 'pending']);
+
+        return true;
+    }
+
+    /**
+     * The execution-ownership fence for everything that happens to a
+     * turn after claimNextTurn() returns - reclaim()'s own atomic UPDATE
+     * only protects the reclaim decision itself; nothing about it stops
+     * an execution that already had its own (now stale) copy of $turn
+     * loaded from simply continuing to run and writing to the same row
+     * once another execution has reclaimed it, since a DB write made by a
+     * different process never touches this process's already-loaded
+     * Eloquent object. This closes that gap: the write only takes effect
+     * if $turn's row still has the exact updated_at this execution last
+     * observed - reclaim() (or another execution's own guarded write)
+     * always changes it, so a mismatch here means ownership has moved on.
+     *
+     * 0 affected rows leaves $turn's own attributes untouched and returns
+     * false; the caller must treat that as "stop processing this turn"
+     * (see ownershipLostException()), never as if the write had happened.
+     * On success, $turn is refreshed from the database (not just patched
+     * with $attributes in memory) so a chain of several guarded writes
+     * against the same turn within one execution - the LLM-completion
+     * write followed by the TTS-completion write, for instance - each
+     * correctly fence against what this execution itself most recently
+     * wrote, regardless of the column's actual stored timestamp precision.
+     */
+    protected function guardedTurnUpdate(VoiceTurn $turn, array $attributes): bool
+    {
+        $affected = VoiceTurn::query()
+            ->whereKey($turn->id)
+            ->where('updated_at', $turn->updated_at)
+            ->update($attributes);
+
+        if ($affected === 0) {
+            return false;
+        }
+
+        $turn->refresh();
+
+        return true;
+    }
+
+    /**
+     * A read-only ownership check for a call site that doesn't itself
+     * write to $turn - the $onStep usage callback, which credits the
+     * SESSION's counters, not the turn row, so guardedTurnUpdate()'s
+     * conditional UPDATE doesn't apply directly. Same fencing token
+     * (updated_at) and the same "has anything changed this row since I
+     * last observed it" question, just via a read instead of a write.
+     *
+     * This has an inherent, narrow TOCTOU gap between the check and
+     * whatever the caller does next (crediting usage is not part of one
+     * atomic database statement with this check) - accepted here for the
+     * same reason recovery as a whole is already documented as
+     * at-least-once rather than exactly-once: closing it completely would
+     * need a single atomic "increment session usage AND verify turn
+     * ownership" statement spanning two different tables, which is out of
+     * proportion to a race whose window is microseconds against a
+     * staleness threshold measured in minutes.
+     */
+    protected function stillOwnsTurn(VoiceTurn $turn): bool
+    {
+        return VoiceTurn::query()
+            ->whereKey($turn->id)
+            ->where('updated_at', $turn->updated_at)
+            ->exists();
+    }
+
+    /**
+     * The one message used everywhere a guarded write/check detects that
+     * this execution no longer owns a turn - reused rather than
+     * constructed ad hoc at each call site so every ownership-loss
+     * exception reads identically regardless of which stage detected it.
+     */
+    protected function ownershipLostException(VoiceTurn $turn): TurnOwnershipLostException
+    {
+        return new TurnOwnershipLostException(
+            "Voice turn #{$turn->id} was recovered by another attempt before this one finished."
+        );
+    }
+
+    /**
+     * Formats an already-determined duplicate outcome (completed or
+     * failed) into what handleTurn() returns or throws. The actual
+     * pair-inspection that decided this outcome already happened under
+     * the session lock, inside claimNextTurn()/resolveExistingClaim() -
+     * this only turns that decision into the right return value or
+     * exception. Never touches STT, the LLM/tool loop, or TTS.
+     */
+    protected function resolveDuplicateTurn(array $claim): VoiceTurn
+    {
+        $turn = $claim['turn'];
+
+        if ($claim['outcome'] === 'duplicate_failed') {
+            throw new VoiceException($turn->error_message ?: 'This request previously failed and will not be retried under the same idempotency key.');
+        }
+
+        return $turn;
     }
 
     protected function buildMessageHistory(VoiceSession $session, int $beforeSequence): array

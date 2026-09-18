@@ -7,6 +7,7 @@ use EasyAI\LaravelVoice\Models\VoiceTurn;
 use EasyAI\LaravelVoice\Tests\Support\FakeUser;
 use EasyAI\LaravelVoice\Tests\TestCase;
 use Illuminate\Http\UploadedFile;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Storage;
 
@@ -216,5 +217,65 @@ class VoiceHttpIdempotencyTest extends TestCase
 
         Http::assertSentCount(6);
         $this->assertSame(4, VoiceTurn::where('voice_session_id', $sessionId)->count());
+    }
+
+    /**
+     * Deep-audit Fix 3: the previous recovery-response-shape test only
+     * checked `$result instanceof VoiceTurn` on the return value of
+     * VoiceAgent::handleTurn() directly - never at risk of changing, and
+     * never exercising VoiceTurnController::store()'s actual JSON
+     * serialization. This goes through the real HTTP endpoint for both a
+     * normal turn and a recovered one and compares the response
+     * structure, not the object type.
+     */
+    public function test_a_recovered_turn_over_http_has_the_identical_response_shape_as_a_normal_turn(): void
+    {
+        $this->actingAsFakeUser(7);
+
+        Http::fake([
+            'api.openai.com/v1/audio/transcriptions' => Http::response(['text' => 'Hello there']),
+            'api.openai.com/v1/chat/completions' => Http::response([
+                'model' => 'gpt-4o-mini',
+                'choices' => [['message' => ['content' => 'Hi! How can I help?']]],
+                'usage' => ['prompt_tokens' => 5, 'completion_tokens' => 5],
+            ]),
+            'api.openai.com/v1/audio/speech' => Http::response('binary-audio-bytes', 200, ['Content-Type' => 'audio/mpeg']),
+        ]);
+
+        $sessionId = $this->postJson('/voice/sessions', ['agent' => 'receptionist'])->json('id');
+        $audio = UploadedFile::fake()->create('speech.mp3', 10, 'audio/mpeg');
+
+        $normal = $this->withHeaders(['Idempotency-Key' => 'normal-attempt'])
+            ->post("/voice/sessions/{$sessionId}/turns", ['audio' => $audio]);
+        $normal->assertOk();
+
+        // A stale pending user turn under a DIFFERENT key - simulates an
+        // earlier attempt whose owning process never came back, well past
+        // the production default stale_after_seconds threshold (300s).
+        $staleTurn = VoiceTurn::create([
+            'voice_session_id' => $sessionId,
+            'sequence' => 3,
+            'speaker' => 'user',
+            'status' => 'pending',
+            'idempotency_key' => 'recovered-attempt',
+        ]);
+        DB::table('voice_turns')->where('id', $staleTurn->id)->update(['updated_at' => now()->subSeconds(600)]);
+
+        $recovered = $this->withHeaders(['Idempotency-Key' => 'recovered-attempt'])
+            ->post("/voice/sessions/{$sessionId}/turns", ['audio' => $audio]);
+        $recovered->assertOk();
+
+        // Same keys, same value types - not brittle exact values (ids,
+        // urls and latency genuinely differ between the two turns), but
+        // the external response contract itself must be identical.
+        $this->assertSame(array_keys($normal->json()), array_keys($recovered->json()));
+
+        foreach ($normal->json() as $key => $value) {
+            $this->assertSame(
+                gettype($value),
+                gettype($recovered->json($key)),
+                "Expected the '{$key}' field to have the same type on both a normal and a recovered response."
+            );
+        }
     }
 }
