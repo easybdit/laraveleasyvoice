@@ -22,6 +22,7 @@ use EasyAI\LaravelVoice\Models\VoiceSession;
 use EasyAI\LaravelVoice\Models\VoiceTurn;
 use EasyAI\LaravelVoice\Support\CurrentVoiceSession;
 use EasyAI\LaravelVoice\VoiceManager;
+use Illuminate\Support\Facades\DB;
 
 class VoiceAgent
 {
@@ -202,14 +203,37 @@ class VoiceAgent
     {
         $this->guardSessionIsUsable($session);
 
-        $sequence = ((int) $session->turns()->max('sequence')) + 1;
+        // Only this step - locking the session row, computing the next
+        // sequence, and inserting the pending user turn - runs inside a
+        // transaction. lockForUpdate() serializes two overlapping
+        // handleTurn() calls for the SAME session against each other on a
+        // real row-locking engine (MySQL/MariaDB's InnoDB), so they can
+        // never both compute the same next sequence. SQLite has no
+        // equivalent row-level lock and silently ignores lockForUpdate()
+        // (a documented Laravel/SQLite limitation, not something this
+        // package can change) - the voice_turns(voice_session_id, sequence)
+        // unique index added alongside this is what still guarantees a
+        // collision is rejected rather than silently corrupting data even
+        // there. STT, the LLM/tool-calling loop, and TTS - every external
+        // provider call - all happen after this transaction has already
+        // committed and released the lock, never inside it; holding a lock
+        // across seconds of network latency would serialize unrelated
+        // requests against each other for far longer than necessary and
+        // risk real lock-wait-timeout errors under load.
+        [$sequence, $userTurn] = DB::transaction(function () use ($session) {
+            VoiceSession::query()->whereKey($session->id)->lockForUpdate()->firstOrFail();
 
-        $userTurn = VoiceTurn::create([
-            'voice_session_id' => $session->id,
-            'sequence' => $sequence,
-            'speaker' => 'user',
-            'status' => 'pending',
-        ]);
+            $sequence = ((int) $session->turns()->max('sequence')) + 1;
+
+            $userTurn = VoiceTurn::create([
+                'voice_session_id' => $session->id,
+                'sequence' => $sequence,
+                'speaker' => 'user',
+                'status' => 'pending',
+            ]);
+
+            return [$sequence, $userTurn];
+        });
 
         try {
             $transcription = $this->voice->stt($this->sttDriver)->transcribe($audioFilePath, $options['stt'] ?? []);
@@ -427,10 +451,20 @@ class VoiceAgent
 
     /**
      * getEstimatedCost() returns null unless ai.pricing.{provider}.{model}
-     * is configured (EasyAI never guesses a price) - accumulated manually
-     * rather than via increment() because SQL's `NULL + amount` evaluates
-     * to NULL, which would leave voice_sessions.estimated_cost stuck at
-     * NULL forever the first time a null was ever added to it.
+     * is configured (EasyAI never guesses a price) - never invented here.
+     *
+     * Deliberately not a plain increment(): SQL's `NULL + amount`
+     * evaluates to NULL, which would leave voice_sessions.estimated_cost
+     * stuck at NULL forever the first time a null was ever added to it.
+     * Also deliberately not `$session->update(['estimated_cost' =>
+     * ($session->estimated_cost ?? 0) + $cost])` - that reads the PHP
+     * object's possibly-stale in-memory value and writes a PHP-computed
+     * literal back, a classic lost-update race if two turns for the same
+     * session accumulate cost concurrently (the second overwrites the
+     * first's contribution with a total computed from a read that never
+     * saw it). COALESCE(...) + ? inside the UPDATE itself makes the whole
+     * read-modify-write atomic at the database level in one statement,
+     * with $cost passed as a bound parameter rather than interpolated.
      */
     protected function accumulateCost(VoiceSession $session, ?float $cost): void
     {
@@ -438,7 +472,10 @@ class VoiceAgent
             return;
         }
 
-        $session->update(['estimated_cost' => ($session->estimated_cost ?? 0) + $cost]);
+        $session->getConnection()->statement(
+            'update '.$session->getTable().' set estimated_cost = coalesce(estimated_cost, 0) + ? where '.$session->getKeyName().' = ?',
+            [$cost, $session->getKey()]
+        );
     }
 
     protected function guardSessionIsUsable(VoiceSession $session): void

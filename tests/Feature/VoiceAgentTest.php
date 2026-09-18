@@ -12,7 +12,10 @@ use EasyAI\LaravelVoice\Events\ToolCallCompleted;
 use EasyAI\LaravelVoice\Events\ToolCallStarted;
 use EasyAI\LaravelVoice\Exceptions\VoiceLimitExceededException;
 use EasyAI\LaravelVoice\Facades\Voice;
+use EasyAI\LaravelVoice\Models\VoiceTurn;
 use EasyAI\LaravelVoice\Tests\TestCase;
+use Illuminate\Database\QueryException;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Gate;
 use Illuminate\Support\Facades\Http;
@@ -190,6 +193,42 @@ class VoiceAgentTest extends TestCase
         Event::assertDispatched(SessionEnded::class);
     }
 
+    /**
+     * Defense-in-depth for the sequence-locking fix in handleTurn(): the
+     * voice_turns(voice_session_id, sequence) unique index (a new,
+     * additive migration) must reject a second row that collides with an
+     * already-persisted one for the same session, rather than allowing
+     * corrupted/ambiguous turn ordering to be written silently. Tested
+     * directly against the schema/constraint here, not by attempting real
+     * concurrent requests - this single-process PHPUnit suite (running
+     * against SQLite, which has no row-level locking) cannot faithfully
+     * reproduce true concurrent locking behaviour; lockForUpdate()'s
+     * actual serialization is a MySQL/MariaDB (InnoDB) production
+     * property verified by code review, not by an automated test here.
+     * This constraint is the layer that stays enforced even so.
+     */
+    public function test_the_database_rejects_a_second_turn_with_a_colliding_sequence_for_the_same_session(): void
+    {
+        $agent = Voice::agent('receptionist');
+        $session = $agent->startSession(['user_id' => 1]);
+
+        VoiceTurn::create([
+            'voice_session_id' => $session->id,
+            'sequence' => 1,
+            'speaker' => 'user',
+            'status' => 'completed',
+        ]);
+
+        $this->expectException(QueryException::class);
+
+        VoiceTurn::create([
+            'voice_session_id' => $session->id,
+            'sequence' => 1,
+            'speaker' => 'assistant',
+            'status' => 'completed',
+        ]);
+    }
+
     public function test_streaming_fires_a_chunk_event_per_delta_and_still_persists_the_full_reply(): void
     {
         Event::fake();
@@ -361,6 +400,51 @@ class VoiceAgentTest extends TestCase
         $this->assertSame(3200, $session->total_stt_ms);
         // 1000 prompt tokens @ $0.01/1k + 1000 completion tokens @ $0.03/1k
         $this->assertEqualsWithDelta(0.04, $session->estimated_cost, 0.0001);
+    }
+
+    /**
+     * accumulateCost() must never lose a cost contribution written
+     * directly to the database in between this PHP process's own read and
+     * write - the exact shape of a real concurrent-turn lost-update race,
+     * reproduced deterministically in a single process by writing to the
+     * row out from under the in-memory $session object (which is never
+     * refreshed here), simulating "another turn already committed its own
+     * contribution a moment ago." The old `$session->update([
+     * 'estimated_cost' => ($session->estimated_cost ?? 0) + $cost])`
+     * would read this test's still-null in-memory attribute and overwrite
+     * the injected value entirely; the atomic `COALESCE(estimated_cost,
+     * 0) + ?` update reads the row's real current value at write time
+     * regardless of what the PHP object thinks it is.
+     */
+    public function test_estimated_cost_accumulation_never_loses_a_value_written_concurrently_by_another_process(): void
+    {
+        config(['ai.pricing.openai.gpt-4o-mini' => ['input' => 0.01, 'output' => 0.03]]);
+
+        $this->fakeChatCompletion('Open enrollment.');
+
+        $agent = Voice::agent('receptionist');
+        $session = $agent->startSession(['user_id' => 1]);
+
+        // Simulate a concurrent turn's contribution landing in the
+        // database - deliberately bypassing $session (its in-memory
+        // estimated_cost attribute stays null, exactly as a stale read
+        // would in a real race).
+        DB::table('voice_sessions')->where('id', $session->id)->update(['estimated_cost' => 0.05]);
+
+        $audioPath = $this->makeTempAudioFile();
+
+        try {
+            $agent->handleTurn($session, $audioPath);
+        } finally {
+            unlink($audioPath);
+        }
+
+        // fakeChatCompletion() reports usage of 12 prompt / 8 completion
+        // tokens (see that helper below): 12/1000*0.01 + 8/1000*0.03 =
+        // 0.00012 + 0.00024 = 0.00036. The "concurrently written" 0.05
+        // must still be present in the total, not silently discarded.
+        $session->refresh();
+        $this->assertEqualsWithDelta(0.05036, $session->estimated_cost, 0.000001);
     }
 
     /**

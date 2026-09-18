@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### 🔒 Phase 25: concurrent-turn data integrity - sequence locking and atomic cost accounting
+
+An architectural audit found two real gaps in how `VoiceAgent::handleTurn()` handles two turns for the *same* session running close together in time (a double-submitted request, a client retry, two devices on one session): nothing prevented them from computing the same next `sequence` value, and `estimated_cost`'s accumulation was a PHP-side read-then-write that could silently drop one turn's contribution if another committed in between.
+
+**Sequence collisions:** the step that claims the next `sequence` and inserts the pending user turn now runs inside `DB::transaction()` with `lockForUpdate()` on the session row - serializing two overlapping `handleTurn()` calls for one session on a real row-locking engine (MySQL/MariaDB's InnoDB). The lock is held only for that fast, DB-only step; STT, the LLM/tool-calling loop, and TTS all run afterward, entirely outside it, so a lock is never held across seconds of external network latency. A new, additive migration adds a `voice_turns(voice_session_id, sequence)` unique index as defense-in-depth, so any collision that still slips through (e.g. on SQLite, which has no real row-level lock and silently ignores `lockForUpdate()`) is rejected as a clean database error instead of corrupting turn ordering.
+
+**Cost accounting:** `accumulateCost()` no longer reads `$session->estimated_cost` in PHP and writes a computed literal back - it now issues a single, atomic `UPDATE ... SET estimated_cost = COALESCE(estimated_cost, 0) + ?` with the cost passed as a bound parameter, so two turns accumulating cost around the same time can never overwrite each other's contribution. The existing "never invent a cost" contract is unchanged - `estimated_cost` still stays `NULL` until at least one step has a configured `ai.pricing` rate.
+
+Token counters (`total_stt_ms`, `total_tts_ms`, `total_prompt_tokens`, `total_completion_tokens`) were already safe - Eloquent's `increment()` already compiles to an atomic SQL update - and are unchanged.
+
+2 new regression tests: one proves the atomic cost update preserves a value written directly to the database out from under a stale in-memory session object (the exact shape of the race the old code was vulnerable to); one proves the new unique index rejects a second turn with a colliding sequence for the same session. Honestly scoped: this single-process SQLite-based test suite cannot faithfully reproduce true concurrent-request locking, so `lockForUpdate()`'s actual serialization under InnoDB is a production property verified by code review, not by an automated test here - the unique constraint is the layer this suite can and does verify directly. Full suite: 123 tests, 372 assertions, all passing (2 intentionally skipped - the Phase 1/2 live-API integration tests, absent a real key).
+
 ### 📊 Phase 24: LLM usage/cost accounting fixed for multi-step tool-calling turns
 
 Confirmed by a source-level audit (Phase 8's own discovery): `VoiceAgent::handleTurn()` previously read `getPromptTokens()`/`getCompletionTokens()`/`getEstimatedCost()` only off the single `AIResponse` LaravelEasyAI's `run()` returns - the *last* step of its agent loop. A tool-calling turn makes two or more real LLM calls (the tool-call decision, then the final answer), so every step before the last silently never counted toward `voice_sessions.total_prompt_tokens`/`total_completion_tokens`/`estimated_cost` - a real correctness gap in a feature this package's own README pitches for "a future billing layer."

@@ -537,6 +537,7 @@ This package assumes it will run in front of real, paid, third-party APIs and ha
 - **Routes are opt-in and authenticated by default.** `voice.routes.enabled` defaults to `false`; once enabled, `auth` stays in the middleware list unless you explicitly set `VOICE_ROUTES_REQUIRE_AUTH=false`, and guest access needs a second, explicit flag (`voice.routes.allow_guest`) on top of that.
 - **Errors are redacted before they reach the client.** A provider-side failure over HTTP returns a generic "temporarily unavailable" message and a 502 — the real exception is still logged server-side via `report()`, never echoed back.
 - **Double-checked upload limits.** The HTTP layer validates file size/type before touching disk; the STT provider re-checks independently, so a bypassed or custom-built controller still can't push an oversized file through to a billed API call.
+- **Concurrent turns for one session can't corrupt data or lose usage.** `handleTurn()` locks the session row (`lockForUpdate()`, released before any STT/LLM/TTS call — never held across network latency) while claiming the next turn sequence, backed by a `voice_turns(voice_session_id, sequence)` unique index; `estimated_cost` accumulates via an atomic database-level addition rather than a read-then-write, so two turns updating it around the same time can never silently overwrite each other's contribution.
 
 If you find a security issue, please report it privately rather than as a public GitHub issue.
 
