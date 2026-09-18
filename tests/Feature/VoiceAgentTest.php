@@ -244,6 +244,92 @@ class VoiceAgentTest extends TestCase
         Event::assertNotDispatched(ResponseChunkReceived::class);
     }
 
+    /**
+     * AbstractDriver::run() streams every step of the agent loop, not just
+     * the final one (vendor/easybdit/laraveleasyai/src/Drivers/AbstractDriver.php
+     * run()'s own docblock) - so a step that results in a tool call is also
+     * streamed. OpenAIDriver::handleStream() only invokes the chunk callback
+     * for delta.content, never for delta.tool_calls fragments - confirmed by
+     * reading handleStream() directly, not assumed - so the tool-call step
+     * is expected to fire zero ResponseChunkReceived events, and only the
+     * subsequent final-answer step (after the tool result is fed back)
+     * should stream real content chunks.
+     */
+    public function test_streaming_and_tools_together_only_emit_chunks_for_the_final_answer_step(): void
+    {
+        Event::fake();
+        Gate::define('view-attendance', fn ($user = null) => true);
+
+        Voice::registerAgent('streaming-tools-bot', function ($agent) {
+            $agent->stt('openai')->tts('openai')->llm('openai')->streamResponses()->tools([
+                AuthorizedTool::make(
+                    name: 'check_attendance',
+                    description: "Check today's attendance",
+                    parameters: ['type' => 'object', 'properties' => []],
+                    ability: 'view-attendance',
+                    handler: fn (array $args) => ['present' => 42],
+                    tier: AuthorizedTool::TIER_READ,
+                ),
+            ]);
+        });
+
+        Http::fake([
+            'api.openai.com/v1/audio/transcriptions' => Http::response(['text' => 'How many students are here today?']),
+            'api.openai.com/v1/audio/speech' => Http::response('binary-audio-bytes', 200, ['Content-Type' => 'audio/mpeg']),
+            'api.openai.com/v1/chat/completions' => Http::sequence()
+                // Step 1: the model asks for a tool call - delta.tool_calls
+                // fragments only, no delta.content anywhere, mirroring
+                // OpenAI's real wire format (id/name arrive complete in the
+                // first delta, arguments arrive as a partial JSON string
+                // split across deltas - see handleStream()'s own docblock).
+                ->push(
+                    "data: {\"model\":\"gpt-4o-mini\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"check_attendance\",\"arguments\":\"\"}}]}}]}\n\n".
+                    "data: {\"model\":\"gpt-4o-mini\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{}\"}}]}}]}\n\n".
+                    "data: [DONE]\n\n",
+                    200,
+                    ['Content-Type' => 'text/event-stream']
+                )
+                // Step 2: the final answer, streamed as plain content
+                // deltas - same fixture style as the streaming-only test
+                // above.
+                ->push(
+                    "data: {\"model\":\"gpt-4o-mini\",\"choices\":[{\"delta\":{\"content\":\"42 students\"}}]}\n\n".
+                    "data: {\"model\":\"gpt-4o-mini\",\"choices\":[{\"delta\":{\"content\":\" are present today.\"}}]}\n\n".
+                    "data: [DONE]\n\n",
+                    200,
+                    ['Content-Type' => 'text/event-stream']
+                ),
+        ]);
+
+        $agent = Voice::agent('streaming-tools-bot');
+        $session = $agent->startSession(['user_id' => 1]);
+        $audioPath = $this->makeTempAudioFile();
+
+        try {
+            $assistantTurn = $agent->handleTurn($session, $audioPath);
+        } finally {
+            unlink($audioPath);
+        }
+
+        // The tool actually executed.
+        Event::assertDispatched(ToolCallCompleted::class, fn (ToolCallCompleted $e) => $e->tool === 'check_attendance' && $e->result === ['present' => 42]);
+
+        // Chunks fired only for the final-answer step's two deltas - if the
+        // tool-call step had also emitted any, this count would be higher.
+        Event::assertDispatchedTimes(ResponseChunkReceived::class, 2);
+        Event::assertDispatched(ResponseChunkReceived::class, fn (ResponseChunkReceived $e) => $e->chunk === '42 students');
+        Event::assertDispatched(ResponseChunkReceived::class, fn (ResponseChunkReceived $e) => $e->chunk === ' are present today.');
+
+        // Final transcript persisted, tool call persisted, turn completed, TTS ran.
+        $this->assertSame('42 students are present today.', $assistantTurn->transcript);
+        $this->assertSame('completed', $assistantTurn->status);
+        $this->assertNotEmpty($assistantTurn->tool_calls);
+        $this->assertSame('check_attendance', $assistantTurn->tool_calls[0]['name']);
+        $this->assertSame(AuthorizedTool::TIER_READ, $assistantTurn->tool_calls[0]['tier']);
+        $this->assertNotNull($assistantTurn->audio_path);
+        Storage::disk('local')->assertExists($assistantTurn->audio_path);
+    }
+
     public function test_it_tracks_stt_duration_and_estimated_cost_on_the_session(): void
     {
         config(['ai.pricing.openai.gpt-4o-mini' => ['input' => 0.01, 'output' => 0.03]]);

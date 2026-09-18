@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### 🎛️ Phase 22: streaming responses and tool-calling verified together
+
+`VoiceAgent::streamResponses()` and `->tools()` are independent, orthogonal setters - nothing in this package or in LaravelEasyAI's `AbstractDriver::run()` prevents both being active on the same agent, and `run()`'s own docblock says every step of the agent loop streams when `$onChunk` is given, not just the final one - but no existing test had ever exercised the combination. This phase closes that gap with one new test in `tests/Feature/VoiceAgentTest.php`, test-only, no production code changed.
+
+The test proves the exact interaction found by inspecting `OpenAIDriver::handleStream()`: a tool-call step's SSE stream (`delta.tool_calls` fragments only, no `delta.content`) emits **zero** `ResponseChunkReceived` events, since `handleStream()` only invokes its callback for content deltas - while the subsequent final-answer step's SSE stream emits `ResponseChunkReceived` for each of its content deltas as expected. Also verified in the same turn: the tool actually executes, `tool_calls` (name/tier) persists on the assistant `voice_turns` row, and the turn's `transcript`/`status`/`audio_path` persistence and TTS behavior are unaffected by streaming being active.
+
+**The test passed against the existing implementation on the first run - no bug found, no production code touched.** Full suite: 119 tests, 360 assertions, all passing (2 intentionally skipped - the Phase 1/2 live-API integration tests, absent a real key).
+
 ### 🧪 Phase 21: tool-calling verified through the real HTTP turn endpoint
 
 Every existing tool-calling test up to this point - the Phase 6 `AuthorizedTool` tests, `VoiceAgentTest`, Phase 20's `VoiceAgentDeepgramToolsTest` - called `VoiceAgent::handleTurn()` directly; none exercised the actual public HTTP surface, `POST /voice/sessions` → `POST /voice/sessions/{id}/turns`. This was named explicitly as a deferred item in Phase 20's own scope notes. This phase closes it: `tests/Feature/VoiceHttpToolsTest.php` (2 new tests) proves `AuthorizedTool`-based tool-calling survives the real HTTP path - auth/ownership middleware, a real multipart audio upload, and `VoiceTurnController::store()`'s JSON response - not just the orchestrator level.
