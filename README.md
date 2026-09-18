@@ -124,6 +124,16 @@ POST /voice/sessions/1/end    {}                                  -> {"id": 1, "
 
 Every session-scoped route 403s for anyone who isn't the session's owner (`VoiceSession::isOwnedBy()`). To allow anonymous callers, set both `VOICE_ROUTES_ALLOW_GUEST=true` **and** `VOICE_ROUTES_REQUIRE_AUTH=false` in `.env` — a long-lived signed cookie (separate from LaravelEasyAI's own guest cookie) identifies a returning guest, same pattern LaravelEasyAI uses for its chat widget, deliberately kept as an independent config surface so the two packages' access policies can never silently affect each other. `VOICE_ROUTES_REQUIRE_AUTH` is deliberately an env var, not something you hand-edit in the `middleware` array of the published config file — a local test toggle that lives in a config file gets silently lost the next time that file is republished (`vendor:publish --force`), which is exactly the mistake that happened while dogfooding this package and is now fixed at the source.
 
+**Retrying a turn safely — `Idempotency-Key` (optional):** a network timeout doesn't tell you whether the server actually finished processing your last request. Send the same client-generated key on a retry and `POST /voice/sessions/{id}/turns` becomes safe to repeat — STT/LLM/tools/TTS never run twice for it, and you get back the exact same response instead of a second billed turn:
+
+```
+POST /voice/sessions/1/turns
+Idempotency-Key: <a client-generated id, unique per attempt>
+multipart: audio=<file>
+```
+
+A key already tied to a turn still being processed returns `409`; a key tied to one that already finished returns the original result again, unchanged. A key already tied to one that failed returns that same failure — retrying under that exact key is not re-attempted, so use a new key if you genuinely want to try again. Omit the header entirely for the exact behavior this package has always had.
+
 ## Streaming text responses (opt-in)
 
 ```php

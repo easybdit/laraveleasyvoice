@@ -10,7 +10,7 @@ class VoiceTurn extends Model
     protected $fillable = [
         'voice_session_id', 'sequence', 'speaker', 'transcript',
         'audio_path', 'audio_duration_ms', 'tool_calls', 'latency_ms',
-        'status', 'error_message',
+        'status', 'error_message', 'idempotency_key',
     ];
 
     protected $casts = [

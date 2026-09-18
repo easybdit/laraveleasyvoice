@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+### 🔁 Phase 26: safe retries - `Idempotency-Key` support, and `maxTurns` made concurrency-safe
+
+Phase 25 fixed sequence collisions and cost lost-updates between two *overlapping* turns for one session; this phase closes the related gap Phase 25 explicitly deferred - two turns for one session that are the *same logical attempt* (a client timeout followed by a retry, a double-submitted request). Without an idempotency mechanism, a retry re-ran STT/LLM/tools/TTS in full and charged usage a second time for work the server may have already finished.
+
+**`$options['idempotency_key']`** on `VoiceAgent::handleTurn()` (and the optional `Idempotency-Key` HTTP header on `POST /voice/sessions/{id}/turns`, wired straight through, unchanged elsewhere) identifies one logical turn attempt. The duplicate lookup runs inside the *same* `lockForUpdate()` transaction Phase 25 already added - no new lock, no Redis, no new dependency, no new idempotency table. A second call with a key already claimed by an earlier attempt:
+- **completed** → returns that exact original result - the identical `{id, transcript, audio_url, tool_calls, latency_ms}` response, reconstructed from the already-persisted turn, with zero new provider calls and zero new usage/cost charged.
+- **still processing** → `409`, rather than starting a second concurrent attempt under the same key.
+- **failed** → the original stored failure is returned again; a key is bound to its outcome once, permanently - retrying under the *same* key is not re-attempted (use a new key to genuinely try again). Deliberately out of scope for this phase, same as stale-pending reclaim.
+
+**The user turn alone was not enough to determine the real outcome**, confirmed by tracing the actual failure paths: an LLM failure leaves the *user* turn `completed` (STT succeeded) with the *assistant* turn `failed`; a TTS failure leaves the assistant turn `completed` with a `null` audio path (existing, unchanged behavior). The duplicate check always consults the keyed user turn's paired assistant turn (`sequence + 1`, an exact hit on Phase 25's own unique index) before deciding, so a duplicate of a TTS-only failure correctly reconstructs the successful text answer rather than replaying an error that was never really about the text.
+
+**`maxTurns`/`maxSessionSeconds` moved inside the same lock**, closing the concurrency gap Phase 25 deliberately left open (moving it in earlier would have let a limit-triggered `DB::transaction()` rollback silently undo the session's own `'ended'` status change). The limit check and the durable "end the session" write now happen atomically with the sequence claim; the exception is only thrown - and the `SessionEnded` event only fired, off a freshly-refreshed session - after that transaction has committed, so the status change can never be rolled back out from under it.
+
+New `voice_turns.idempotency_key` column (nullable, additive migration from Phase 9B Step 1) plus a `(voice_session_id, idempotency_key)` unique index enforce this at the database level too, not just in application code - a `NULL` key (the default, existing behavior) never collides with another `NULL` on MySQL/MariaDB/SQLite/PostgreSQL, so omitting the header/option is completely unaffected.
+
+16 new tests across two files (`VoiceAgentIdempotencyTest`, `VoiceHttpIdempotencyTest`) covering: no-key legacy behavior is unchanged, a keyed turn completes normally, a completed duplicate returns the identical result with zero provider calls/new turns/duplicate usage, a still-processing duplicate returns a conflict, an STT- and an LLM-failed duplicate each replay their exact original stored error, a TTS-failure duplicate correctly reconstructs the null-audio success response, and a key already committed by another process (simulated the same way Phase 25's cost-race test does - written directly to the database, bypassing any in-process state) is detected with zero provider calls, the closest honest proxy this single-process SQLite suite can offer for real concurrent-request behavior.
+
+A follow-up skeptical re-audit of this same diff closed three further gaps before this phase's tests were considered complete: an explicitly empty `Idempotency-Key` header is now normalized to `null` (an empty string is otherwise a normal, non-`NULL` value that would incorrectly self-collide with another empty key under the unique index); a genuinely new key - never seen before for the session - is now explicitly proven, not just reasoned about, to be unable to bypass the ended-session or `maxTurns` checks; and the narrow window where a keyed user turn is already `completed` but its paired assistant turn doesn't exist yet is now explicitly proven to return `409` rather than being mistaken for a failure or success.
+
+Full suite: 139 tests, 425 assertions, all passing (2 intentionally skipped - the Phase 1/2 live-API integration tests, absent a real key).
+
 ### 🔒 Phase 25: concurrent-turn data integrity - sequence locking and atomic cost accounting
 
 An architectural audit found two real gaps in how `VoiceAgent::handleTurn()` handles two turns for the *same* session running close together in time (a double-submitted request, a client retry, two devices on one session): nothing prevented them from computing the same next `sequence` value, and `estimated_cost`'s accumulation was a PHP-side read-then-write that could silently drop one turn's contribution if another committed in between.

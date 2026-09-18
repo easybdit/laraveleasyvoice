@@ -46,8 +46,17 @@ class VoiceTurnController extends Controller
         $audioFilePath = $uploadedAudio->getRealPath().'.'.$extension;
         copy($uploadedAudio->getRealPath(), $audioFilePath);
 
+        // Optional - identifies one logical turn attempt. A retry (client
+        // timeout, double-submit) sent with the same header never re-runs
+        // STT/LLM/tools/TTS or charges usage twice; see VoiceAgent::
+        // handleTurn()'s own docblock for the exact contract. Omitted
+        // entirely, behavior is unchanged from before this existed.
+        $idempotencyKey = $request->header('Idempotency-Key');
+
         try {
-            $turn = Voice::agent($session->agent)->handleTurn($session, $audioFilePath);
+            $turn = Voice::agent($session->agent)->handleTurn($session, $audioFilePath, [
+                'idempotency_key' => $idempotencyKey,
+            ]);
         } catch (VoiceLimitExceededException $e) {
             return response()->json(['error' => $e->getMessage()], 429);
         } catch (ProviderException|ConnectionException $e) {

@@ -198,42 +198,47 @@ class VoiceAgent
      * relevant turn and re-thrown - the caller (an HTTP controller, a
      * queued job, whatever the host app builds) decides how to surface it,
      * this method never swallows an error silently.
+     *
+     * $options['idempotency_key'] (optional): identifies one logical turn
+     * attempt. A second call with the same key for the same session never
+     * re-runs STT/LLM/tools/TTS or charges usage twice - see
+     * claimNextTurn()/resolveDuplicateTurn() for the exact contract.
      */
     public function handleTurn(VoiceSession $session, string $audioFilePath, array $options = []): VoiceTurn
     {
-        $this->guardSessionIsUsable($session);
+        // An explicitly empty key (e.g. a header sent with no value) is
+        // treated the same as no key at all - normalized here, the single
+        // place both the HTTP controller and any direct caller flow
+        // through, rather than every caller having to remember to do it.
+        // An empty string is otherwise a normal, non-NULL value under the
+        // unique index and would incorrectly self-collide.
+        $idempotencyKey = $options['idempotency_key'] ?? null;
+        if ($idempotencyKey === '') {
+            $idempotencyKey = null;
+        }
 
-        // Only this step - locking the session row, computing the next
-        // sequence, and inserting the pending user turn - runs inside a
-        // transaction. lockForUpdate() serializes two overlapping
-        // handleTurn() calls for the SAME session against each other on a
-        // real row-locking engine (MySQL/MariaDB's InnoDB), so they can
-        // never both compute the same next sequence. SQLite has no
-        // equivalent row-level lock and silently ignores lockForUpdate()
-        // (a documented Laravel/SQLite limitation, not something this
-        // package can change) - the voice_turns(voice_session_id, sequence)
-        // unique index added alongside this is what still guarantees a
-        // collision is rejected rather than silently corrupting data even
-        // there. STT, the LLM/tool-calling loop, and TTS - every external
-        // provider call - all happen after this transaction has already
-        // committed and released the lock, never inside it; holding a lock
-        // across seconds of network latency would serialize unrelated
-        // requests against each other for far longer than necessary and
-        // risk real lock-wait-timeout errors under load.
-        [$sequence, $userTurn] = DB::transaction(function () use ($session) {
-            VoiceSession::query()->whereKey($session->id)->lockForUpdate()->firstOrFail();
+        $claim = $this->claimNextTurn($session, $idempotencyKey);
 
-            $sequence = ((int) $session->turns()->max('sequence')) + 1;
+        if ($claim['outcome'] === 'limit_exceeded') {
+            // claimNextTurn() already committed the 'ended' status on its
+            // own locked copy of this session - refreshed here so both the
+            // event payload and this object's own state match what's now
+            // durably persisted, exactly as the old direct endSession($session)
+            // call (update() keeps its model's in-memory attributes in sync)
+            // already did before this method existed.
+            $session->refresh();
 
-            $userTurn = VoiceTurn::create([
-                'voice_session_id' => $session->id,
-                'sequence' => $sequence,
-                'speaker' => 'user',
-                'status' => 'pending',
-            ]);
+            event(new SessionEnded($session));
 
-            return [$sequence, $userTurn];
-        });
+            throw new VoiceLimitExceededException($claim['message']);
+        }
+
+        if ($claim['outcome'] === 'duplicate') {
+            return $this->resolveDuplicateTurn($session, $claim['userTurn']);
+        }
+
+        $sequence = $claim['sequence'];
+        $userTurn = $claim['userTurn'];
 
         try {
             $transcription = $this->voice->stt($this->sttDriver)->transcribe($audioFilePath, $options['stt'] ?? []);
@@ -478,30 +483,127 @@ class VoiceAgent
         );
     }
 
-    protected function guardSessionIsUsable(VoiceSession $session): void
+    /**
+     * The entire locked, DB-only claim step for one handleTurn() call:
+     * lock the session row, resolve an idempotency-key duplicate if one
+     * was given, enforce maxTurns/maxSessionSeconds, and - only once none
+     * of that short-circuits - claim the next sequence and insert the
+     * pending user turn. Everything here is a fast local read/write; STT/
+     * LLM/tool-calling/TTS all happen after this method returns and the
+     * transaction has released the lock, never inside it.
+     *
+     * Returns an outcome descriptor rather than throwing directly for the
+     * two cases with a durable side effect (limit_exceeded ends the
+     * session) - throwing from inside DB::transaction() rolls the whole
+     * transaction back, which would silently undo that status change.
+     * The caller inspects the outcome and throws/returns only after the
+     * transaction has committed.
+     *
+     * @return array{outcome: 'proceed', sequence: int, userTurn: VoiceTurn}
+     *       | array{outcome: 'duplicate', userTurn: VoiceTurn}
+     *       | array{outcome: 'limit_exceeded', message: string}
+     */
+    protected function claimNextTurn(VoiceSession $session, ?string $idempotencyKey): array
     {
-        if ($session->status !== 'active') {
-            throw new VoiceException("Voice session #{$session->id} is not active.");
+        return DB::transaction(function () use ($session, $idempotencyKey) {
+            $locked = VoiceSession::query()->whereKey($session->id)->lockForUpdate()->firstOrFail();
+
+            // Resolved before the active/limit checks below - a client
+            // asking "what happened to my earlier request?" gets an
+            // answer regardless of whether the session has since ended,
+            // rather than being told the session isn't usable anymore.
+            if ($idempotencyKey !== null) {
+                $existingUserTurn = VoiceTurn::query()
+                    ->where('voice_session_id', $locked->id)
+                    ->where('idempotency_key', $idempotencyKey)
+                    ->first();
+
+                if ($existingUserTurn !== null) {
+                    return ['outcome' => 'duplicate', 'userTurn' => $existingUserTurn];
+                }
+            }
+
+            if ($locked->status !== 'active') {
+                throw new VoiceException("Voice session #{$session->id} is not active.");
+            }
+
+            // Each exchange writes two rows (a user turn and an assistant
+            // turn) - the limit is expressed in exchanges, so only user
+            // turns are counted.
+            if ($locked->turns()->where('speaker', 'user')->count() >= $this->maxTurns) {
+                $locked->update(['status' => 'ended', 'ended_at' => now()]);
+
+                return [
+                    'outcome' => 'limit_exceeded',
+                    'message' => "Voice session #{$session->id} reached its maximum of {$this->maxTurns} turns.",
+                ];
+            }
+
+            if ($locked->started_at !== null && $locked->started_at->diffInSeconds(now()) > $this->maxSessionSeconds) {
+                $locked->update(['status' => 'ended', 'ended_at' => now()]);
+
+                return [
+                    'outcome' => 'limit_exceeded',
+                    'message' => "Voice session #{$session->id} exceeded its maximum duration of {$this->maxSessionSeconds} seconds.",
+                ];
+            }
+
+            $sequence = ((int) $locked->turns()->max('sequence')) + 1;
+
+            $userTurn = VoiceTurn::create([
+                'voice_session_id' => $session->id,
+                'sequence' => $sequence,
+                'speaker' => 'user',
+                'status' => 'pending',
+                'idempotency_key' => $idempotencyKey,
+            ]);
+
+            return ['outcome' => 'proceed', 'sequence' => $sequence, 'userTurn' => $userTurn];
+        });
+    }
+
+    /**
+     * A second handleTurn() call with an idempotency key already claimed
+     * by an earlier attempt for this session. Never touches STT, the LLM/
+     * tool loop, or TTS, and never creates another turn or consumes
+     * another sequence number - only reads what the original attempt
+     * already persisted.
+     *
+     * The user turn alone is not enough to know the real outcome: an LLM
+     * failure leaves the user turn 'completed' (STT succeeded) with the
+     * *assistant* turn 'failed', and a TTS failure leaves the assistant
+     * turn 'completed' with a null audio_path (existing, unchanged
+     * behavior) - so the paired assistant turn (sequence = user turn's
+     * sequence + 1, guaranteed unique by the Phase 9A index) is always
+     * consulted too.
+     */
+    protected function resolveDuplicateTurn(VoiceSession $session, VoiceTurn $userTurn): VoiceTurn
+    {
+        $assistantTurn = VoiceTurn::query()
+            ->where('voice_session_id', $session->id)
+            ->where('sequence', $userTurn->sequence + 1)
+            ->where('speaker', 'assistant')
+            ->first();
+
+        if ($assistantTurn === null) {
+            // No assistant turn yet - either STT is still running, or it
+            // already failed and the loop never got that far.
+            if ($userTurn->status === 'failed') {
+                throw new VoiceException($userTurn->error_message ?: 'This request previously failed and will not be retried under the same idempotency key.');
+            }
+
+            throw new VoiceException('A turn for this idempotency key is still processing.');
         }
 
-        // Each exchange writes two rows (a user turn and an assistant
-        // turn) - the limit is expressed in exchanges, so only user turns
-        // are counted.
-        if ($session->turns()->where('speaker', 'user')->count() >= $this->maxTurns) {
-            $this->endSession($session);
-
-            throw new VoiceLimitExceededException(
-                "Voice session #{$session->id} reached its maximum of {$this->maxTurns} turns."
-            );
+        if ($assistantTurn->status === 'failed') {
+            throw new VoiceException($assistantTurn->error_message ?: 'This request previously failed and will not be retried under the same idempotency key.');
         }
 
-        if ($session->started_at !== null && $session->started_at->diffInSeconds(now()) > $this->maxSessionSeconds) {
-            $this->endSession($session);
-
-            throw new VoiceLimitExceededException(
-                "Voice session #{$session->id} exceeded its maximum duration of {$this->maxSessionSeconds} seconds."
-            );
+        if ($assistantTurn->status !== 'completed') {
+            throw new VoiceException('A turn for this idempotency key is still processing.');
         }
+
+        return $assistantTurn;
     }
 
     protected function buildMessageHistory(VoiceSession $session, int $beforeSequence): array
