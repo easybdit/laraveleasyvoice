@@ -146,6 +146,8 @@ Text only — TTS still synthesizes the complete reply once at the end of the tu
 
 Real, runnable patterns for common voice-agent shapes. Everything below is composition of what's already documented above — none of it needed new package code, which is itself the point: LaravelEasyVoice orchestrates, LaravelEasyAI thinks.
 
+Want a complete, drop-in page instead of a snippet? See **[examples/](examples/)** — three full working pages (the turn-based widget with a real polished UI, OpenAI realtime, Deepgram realtime), each live-tested against a real provider account, with setup instructions.
+
 **Basic voice assistant**
 
 ```php
